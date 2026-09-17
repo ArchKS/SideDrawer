@@ -20,6 +20,12 @@ static BOOL SDEdgeIsHorizontal(NSString *edge) {
     return [edge isEqualToString:SDEdgeTop] || [edge isEqualToString:SDEdgeBottom];
 }
 
+// ai coding: 转义 Finder AppleScript 路径字符串，避免特殊字符破坏选择脚本 2026/09/17: 11:51
+static NSString *SDEscapeAppleScriptString(NSString *value) {
+    NSString *escaped = [value stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
+    return [escaped stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+}
+
 // ai coding: 生成不会被自动布局重置的 -45° 旋转系统图标 2026/09/17: 09:19
 static NSImage *SDRotatedPinSymbol(BOOL locked) {
     NSString *description = locked ? @"旋转-45度的取消固定" : @"旋转-45度的固定抽屉";
@@ -55,6 +61,9 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
                           error:(NSError **)error;
 - (BOOL)renameDrawerID:(NSString *)drawerID name:(NSString *)name error:(NSError **)error;
 - (BOOL)deleteDrawerID:(NSString *)drawerID error:(NSError **)error;
+// ai coding: 声明检测并批量删除空收纳盒的安全操作 2026/09/17: 11:30
+- (BOOL)hasDeletableEmptyDrawers;
+- (NSUInteger)deleteEmptyDrawers:(NSError **)error;
 - (BOOL)importURLs:(NSArray<NSURL *> *)urls drawerID:(NSString *)drawerID error:(NSError **)error;
 - (BOOL)moveItem:(NSURL *)itemURL toDirectory:(NSURL *)directory error:(NSError **)error;
 - (NSURL *)saveDrawerID:(NSString *)drawerID inDirectory:(NSURL *)directory error:(NSError **)error;
@@ -203,6 +212,32 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     if (![NSFileManager.defaultManager removeItemAtURL:[self directoryForDrawer:drawer] error:error]) return NO;
     [_mutableDrawers removeObject:drawer];
     return [self writeMetadata:error];
+}
+
+// ai coding: 仅删除空收纳盒并始终保留至少一个可用收纳盒 2026/09/17: 11:38
+- (BOOL)hasDeletableEmptyDrawers {
+    if (_mutableDrawers.count <= 1) return NO;
+    NSUInteger emptyCount = 0;
+    for (NSDictionary *drawer in _mutableDrawers) {
+        if ([self itemsForDrawerID:drawer[@"id"]].count == 0) emptyCount += 1;
+    }
+    return emptyCount > 0;
+}
+
+- (NSUInteger)deleteEmptyDrawers:(NSError **)error {
+    if (_mutableDrawers.count <= 1) return 0;
+    NSUInteger removedCount = 0;
+    NSArray<NSDictionary *> *drawers = [_mutableDrawers copy];
+    for (NSDictionary *drawer in drawers) {
+        if (_mutableDrawers.count <= 1) break;
+        NSString *drawerID = drawer[@"id"];
+        if ([self itemsForDrawerID:drawerID].count > 0) continue;
+        if (![NSFileManager.defaultManager removeItemAtURL:[self directoryForDrawer:drawer] error:error]) break;
+        [_mutableDrawers removeObject:(NSMutableDictionary *)drawer];
+        removedCount += 1;
+    }
+    if (removedCount > 0 && ![self writeMetadata:error]) return removedCount;
+    return removedCount;
 }
 
 - (BOOL)importURLs:(NSArray<NSURL *> *)urls drawerID:(NSString *)drawerID error:(NSError **)error {
@@ -1779,8 +1814,11 @@ static NSString *SDShortcutDisplayString(CGEventFlags modifiers, NSString *keyNa
 // ai coding: 声明快捷键录制、展示和多抽屉目标选择入口 2026/09/17: 09:19
 - (void)loadMoveShortcut;
 - (void)showShortcutConfiguration:(id)sender;
-- (void)moveURLs:(NSArray<NSURL *> *)urls toDrawerID:(NSString *)drawerID;
-- (void)chooseDrawerAndMoveURLs:(NSArray<NSURL *> *)urls;
+- (BOOL)moveURLs:(NSArray<NSURL *> *)urls toDrawerID:(NSString *)drawerID;
+// ai coding: 声明移动后定位 Finder 相邻项目的快捷键流程接口 2026/09/17: 11:51
+- (BOOL)chooseDrawerAndMoveURLs:(NSArray<NSURL *> *)urls;
+- (NSString *)finderNeighborPathForCurrentSelection;
+- (void)selectFinderItemAtPath:(NSString *)path;
 // ai coding: 声明支持方向键、回车及数字快捷键的多收纳盒选择接口 2026/09/17: 11:23
 - (SDDrawerChoicePanel *)drawerChoicePanelForDrawers:(NSArray<NSDictionary *> *)drawers
                                            itemCount:(NSInteger)itemCount;
@@ -1835,8 +1873,17 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     NSString *_selectedDrawerChoiceID;
 }
 
+- (void)configureApplicationIcon {
+    // ai coding: 启动时显式加载 bundle 图标，确保 Dock 和快捷键面板都能显示 2026/09/17: 11:44
+    NSString *iconPath = [NSBundle.mainBundle pathForResource:@"SideDrawer" ofType:@"icns"];
+    if (iconPath.length == 0) return;
+    NSImage *icon = [[NSImage alloc] initWithContentsOfFile:iconPath];
+    if (icon) NSApp.applicationIconImage = icon;
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
-    // ai coding: 改为标准 macOS 应用显示程序坞图标，并提供可发现的退出入口 2026/09/17: 09:06
+    // ai coding: 启用标准 Dock 图标并在启动时主动刷新应用图标 2026/09/17: 11:44
+    [self configureApplicationIcon];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [self loadMoveShortcut];
     [self configureMainMenu];
@@ -1987,7 +2034,7 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     _statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
     _statusItem.button.image = [NSImage imageWithSystemSymbolName:@"rectangle.stack.fill" accessibilityDescription:@"SideDrawer"];
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@"SideDrawer"];
-    // ai coding: 在状态菜单增加批量新建，并保留常用操作及原生快捷键 2026/09/17: 11:14
+    // ai coding: 在状态菜单增加清空空收纳盒，并保留批量新建和常用操作 2026/09/17: 11:30
     NSMenuItem *newDrawer = [[NSMenuItem alloc] initWithTitle:@"新建收纳盒" action:@selector(createDrawer:) keyEquivalent:@"n"];
     newDrawer.target = self;
     [menu addItem:newDrawer];
@@ -1996,6 +2043,11 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
                                                      keyEquivalent:@""];
     batchNewDrawer.target = self;
     [menu addItem:batchNewDrawer];
+    NSMenuItem *clearEmptyDrawers = [[NSMenuItem alloc] initWithTitle:@"一键清空空收纳盒"
+                                                                action:@selector(deleteEmptyDrawers:)
+                                                         keyEquivalent:@""];
+    clearEmptyDrawers.target = self;
+    [menu addItem:clearEmptyDrawers];
     NSMenuItem *saveDrawer = [[NSMenuItem alloc] initWithTitle:@"保存当前收纳盒为文件夹…"
                                                        action:@selector(saveCurrentDrawer:)
                                                 keyEquivalent:@"s"];
@@ -2042,7 +2094,7 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     _statusItem.menu = menu;
 }
 
-// ai coding: 在标准菜单增加批量新建，并保留带快捷键标识的常用操作 2026/09/17: 11:14
+// ai coding: 在标准菜单增加清空空收纳盒，并保留批量新建和常用操作 2026/09/17: 11:30
 - (void)configureMainMenu {
     NSMenu *mainMenu = [[NSMenu alloc] initWithTitle:@"MainMenu"];
     NSMenuItem *applicationItem = [[NSMenuItem alloc] initWithTitle:@"SideDrawer" action:nil keyEquivalent:@""];
@@ -2083,6 +2135,11 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
                                                      keyEquivalent:@""];
     batchNewDrawer.target = self;
     [drawerMenu addItem:batchNewDrawer];
+    NSMenuItem *clearEmptyDrawers = [[NSMenuItem alloc] initWithTitle:@"一键清空空收纳盒"
+                                                                action:@selector(deleteEmptyDrawers:)
+                                                         keyEquivalent:@""];
+    clearEmptyDrawers.target = self;
+    [drawerMenu addItem:clearEmptyDrawers];
     NSMenuItem *saveDrawer = [[NSMenuItem alloc] initWithTitle:@"保存当前收纳盒为文件夹…"
                                                        action:@selector(saveCurrentDrawer:)
                                                 keyEquivalent:@"s"];
@@ -2133,8 +2190,17 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     [[self activeDrawerController] deleteSelectedItems];
 }
 
+// ai coding: 执行菜单中的一键清空空收纳盒并同步剩余窗口 2026/09/17: 11:30
+- (void)deleteEmptyDrawers:(id)sender {
+    NSError *error = nil;
+    NSUInteger removedCount = [_store deleteEmptyDrawers:&error];
+    if (removedCount > 0) [self syncPanels];
+    if (error) [self showError:error window:nil];
+}
+
 - (BOOL)validateMenuItem:(NSMenuItem *)menuItem {
     SEL action = menuItem.action;
+    if (action == @selector(deleteEmptyDrawers:)) return [_store hasDeletableEmptyDrawers];
     if (action == @selector(selectAllCurrentDrawer:) || action == @selector(saveCurrentDrawer:) ||
         action == @selector(deleteSelectedInCurrentDrawer:)) {
         SDDrawerPanelController *controller = [self activeDrawerController];
@@ -2268,6 +2334,7 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     _shortcutStatusItem.enabled = failed;
 }
 
+// ai coding: 快捷键移动后优先选中原 Finder 容器中的下一个或上一个项目 2026/09/17: 11:51
 - (void)handleGlobalMoveHotKey {
     if (_store.drawers.count == 0) return;
     NSString *source = @"tell application \"Finder\"\n"
@@ -2296,15 +2363,18 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
         NSBeep();
         return;
     }
+    NSString *neighborPath = [self finderNeighborPathForCurrentSelection];
+    BOOL moved = NO;
     if (_store.drawers.count == 1) {
-        [self moveURLs:urls toDrawerID:_store.drawers.firstObject[@"id"]];
+        moved = [self moveURLs:urls toDrawerID:_store.drawers.firstObject[@"id"]];
     } else {
-        [self chooseDrawerAndMoveURLs:urls];
+        moved = [self chooseDrawerAndMoveURLs:urls];
     }
+    if (moved && neighborPath.length > 0) [self selectFinderItemAtPath:neighborPath];
 }
 
-// ai coding: 多个收纳盒时默认高亮首项，并支持鼠标、方向键和组合键选择 2026/09/17: 11:23
-- (void)chooseDrawerAndMoveURLs:(NSArray<NSURL *> *)urls {
+// ai coding: 多个收纳盒选择目标后返回移动结果以便定位相邻 Finder 项目 2026/09/17: 11:51
+- (BOOL)chooseDrawerAndMoveURLs:(NSArray<NSURL *> *)urls {
     [NSApp activateIgnoringOtherApps:YES];
     _selectedDrawerChoiceID = nil;
     _drawerChoicePanel = [self drawerChoicePanelForDrawers:_store.drawers itemCount:urls.count];
@@ -2316,8 +2386,53 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     _drawerChoicePanel = nil;
     _drawerChoiceIDs = nil;
     _selectedDrawerChoiceID = nil;
-    if (response != NSModalResponseOK) return;
-    if (drawerID.length > 0) [self moveURLs:urls toDrawerID:drawerID];
+    if (response != NSModalResponseOK || drawerID.length == 0) return NO;
+    return [self moveURLs:urls toDrawerID:drawerID];
+}
+
+// ai coding: 在移动前按 Finder 容器顺序寻找选区后的下一个或前一个项目 2026/09/17: 11:51
+- (NSString *)finderNeighborPathForCurrentSelection {
+    NSString *source = @"tell application \"Finder\"\n"
+                        "set selectedItems to selection as list\n"
+                        "if (count selectedItems) is 0 then return \"\"\n"
+                        "set firstSelectedItem to item 1 of selectedItems\n"
+                        "set targetContainer to container of firstSelectedItem\n"
+                        "set containerItems to every item of targetContainer\n"
+                        "set minimumIndex to 2147483647\n"
+                        "set maximumIndex to 0\n"
+                        "repeat with selectedItemReference in selectedItems\n"
+                        "set selectedItem to contents of selectedItemReference\n"
+                        "if (container of selectedItem as text) is not (targetContainer as text) then return \"\"\n"
+                        "set currentIndex to index of selectedItem\n"
+                        "if currentIndex < minimumIndex then set minimumIndex to currentIndex\n"
+                        "if currentIndex > maximumIndex then set maximumIndex to currentIndex\n"
+                        "end repeat\n"
+                        "set candidateItem to missing value\n"
+                        "if maximumIndex < (count containerItems) then set candidateItem to item (maximumIndex + 1) of containerItems\n"
+                        "if candidateItem is missing value and minimumIndex > 1 then set candidateItem to item (minimumIndex - 1) of containerItems\n"
+                        "if candidateItem is missing value then return \"\"\n"
+                        "return POSIX path of (candidateItem as alias)\n"
+                        "end tell";
+    NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
+    NSDictionary *scriptError = nil;
+    NSAppleEventDescriptor *result = [script executeAndReturnError:&scriptError];
+    return result.stringValue ?: @"";
+}
+
+// ai coding: 移动成功后延迟选中 Finder 相邻项目，避免容器刷新覆盖选择 2026/09/17: 11:51
+- (void)selectFinderItemAtPath:(NSString *)path {
+    if (path.length == 0) return;
+    NSString *escapedPath = SDEscapeAppleScriptString(path);
+    NSString *source = [NSString stringWithFormat:
+        @"tell application \"Finder\"\n"
+         "set targetItem to POSIX file \"%@\" as alias\n"
+         "set selection to {targetItem}\n"
+         "end tell", escapedPath];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
+        [script executeAndReturnError:nil];
+    });
 }
 
 // ai coding: 将列表项改为左侧纯名称、右侧快捷键提示且不显示图标或数量 2026/09/17: 11:23
@@ -2447,13 +2562,15 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     [NSApp stopModalWithCode:NSModalResponseCancel];
 }
 
-- (void)moveURLs:(NSArray<NSURL *> *)urls toDrawerID:(NSString *)drawerID {
+// ai coding: 让文件移动方法返回成功状态，供快捷键完成后选择相邻项目 2026/09/17: 11:51
+- (BOOL)moveURLs:(NSArray<NSURL *> *)urls toDrawerID:(NSString *)drawerID {
     NSError *error = nil;
     if (![_store importURLs:urls drawerID:drawerID error:&error]) {
         [self showError:error window:_controllers[drawerID].panel];
-        return;
+        return NO;
     }
     [_controllers[drawerID] reloadContent];
+    return YES;
 }
 
 - (void)showAll:(id)sender { for (SDDrawerPanelController *controller in _controllers.allValues) [controller show]; }

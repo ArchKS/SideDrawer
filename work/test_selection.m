@@ -1,4 +1,4 @@
-// ai coding: 验证方向键选择、快捷键提示、四边散开及既有功能 2026/09/17: 11:23
+// ai coding: 回归验证批量清空多个空收纳盒及既有功能 2026/09/17: 11:38
 #define main SideDrawerProductMain
 #import "../Sources/SideDrawer/main.m"
 #undef main
@@ -225,6 +225,7 @@ int main(void) {
         NSMenu *drawerMenu = SDMenuItemWithTitle(NSApp.mainMenu, @"收纳盒").submenu;
         NSMenuItem *menuNew = SDMenuItemWithTitle(drawerMenu, @"新建收纳盒");
         NSMenuItem *menuBatchNew = SDMenuItemWithTitle(drawerMenu, @"批量新建收纳盒…");
+        NSMenuItem *menuClearEmpty = SDMenuItemWithTitle(drawerMenu, @"一键清空空收纳盒");
         NSMenuItem *menuSave = SDMenuItemWithTitle(drawerMenu, @"保存当前收纳盒为文件夹…");
         NSMenuItem *menuSelectAll = SDMenuItemWithTitle(drawerMenu, @"全选当前收纳盒文件");
         NSMenuItem *menuDelete = SDMenuItemWithTitle(drawerMenu, @"将所选项目移到废纸篓");
@@ -235,7 +236,25 @@ int main(void) {
             (menuSave.keyEquivalentModifierMask & NSEventModifierFlagCommand) != 0 &&
             (menuSelectAll.keyEquivalentModifierMask & NSEventModifierFlagCommand) != 0 &&
             menuDelete.keyEquivalent.length == 1 && menuDelete.keyEquivalentModifierMask == 0 &&
-            menuBatchNew != nil;
+            menuBatchNew != nil && menuClearEmpty != nil &&
+            menuClearEmpty.action == @selector(deleteEmptyDrawers:);
+        [menuDelegate setValue:store forKey:@"store"];
+        NSMutableArray<NSString *> *emptyDrawerIDs = [NSMutableArray arrayWithCapacity:6];
+        for (NSInteger emptyIndex = 0; emptyIndex < 6; emptyIndex++) {
+            NSString *emptyDrawerID = [store addDrawerWithName:[NSString stringWithFormat:@"待清空 %ld", (long)emptyIndex + 1]
+                                     copyingDimensionsFromDrawerID:drawerID
+                                                              error:&error];
+            if (emptyDrawerID) [emptyDrawerIDs addObject:emptyDrawerID];
+        }
+        BOOL clearEmptyEnabled = [menuDelegate validateMenuItem:menuClearEmpty];
+        NSUInteger removedEmptyCount = [store deleteEmptyDrawers:&error];
+        BOOL allEmptyDrawersRemoved = YES;
+        for (NSString *emptyDrawerID in emptyDrawerIDs) {
+            allEmptyDrawersRemoved = allEmptyDrawersRemoved && [store drawerForID:emptyDrawerID] == nil;
+        }
+        BOOL clearEmptyReady = clearEmptyEnabled && removedEmptyCount == 6 && allEmptyDrawersRemoved &&
+            store.drawers.count >= 1 &&
+            ![menuDelegate validateMenuItem:menuClearEmpty];
         NSArray<NSString *> *batchNames = [menuDelegate drawerNamesFromBatchInput:@" a， b,c ,, "];
         BOOL batchNamesReady = [batchNames isEqualToArray:@[@"a", @"b", @"c"]];
         NSArray<NSDictionary *> *batchPlacements = [menuDelegate batchPlacementsForCount:6];
@@ -410,14 +429,14 @@ int main(void) {
             carbonModifiersReady && dropAnimationReady && verticalSizeReady && horizontalSizeReady &&
             verticalResizeDirectionReady && normalNameFocusReady && newDrawerNameFocusReady &&
             verticalEdgeSnapReady && horizontalEdgeSnapReady && keyboardRenameReady && menuShortcutsReady &&
-            directChoiceListReady && batchNamesReady && batchPlacementReady && copiedDimensionsReady) {
+            directChoiceListReady && batchNamesReady && batchPlacementReady && copiedDimensionsReady && clearEmptyReady) {
             fprintf(stdout, "SIDEDRAWER_SELECTION_TEST_OK\n");
             return 0;
         }
         fprintf(stderr,
-                "SIDEDRAWER_SELECTION_TEST_FAILED all=%d visible=%d pile=%d batch=%d shortcut=%d menu=%d directChoice=%d batchNames=%d batchPlacement=%d copiedSize=%d stale=%d countHidden=%d borderless=%d plus=%d controls=%d pin=%d centered=%d horizontalControls=%d recorder=%d matcher=%d carbon=%d normalFocus=%d renameFocus=%d keyboardRename=%d verticalSnap=%d horizontalSnap=%d items=(%.1f,%.1f,%.1f,%.1f) drop=%d vertical=%d horizontal=%d resizeDirection=%d resizeHandle=(%.1f,%.1f,%.1f,%.1f)\n",
+                "SIDEDRAWER_SELECTION_TEST_FAILED all=%d visible=%d pile=%d batch=%d shortcut=%d menu=%d clearEmpty=%d directChoice=%d batchNames=%d batchPlacement=%d copiedSize=%d stale=%d countHidden=%d borderless=%d plus=%d controls=%d pin=%d centered=%d horizontalControls=%d recorder=%d matcher=%d carbon=%d normalFocus=%d renameFocus=%d keyboardRename=%d verticalSnap=%d horizontalSnap=%d items=(%.1f,%.1f,%.1f,%.1f) drop=%d vertical=%d horizontal=%d resizeDirection=%d resizeHandle=(%.1f,%.1f,%.1f,%.1f)\n",
                 allItemsSelected, visibleSelected, pileSelected, batchDragReady, shortcutHandled, menuShortcutsReady,
-                directChoiceListReady, batchNamesReady, batchPlacementReady, copiedDimensionsReady,
+                clearEmptyReady, directChoiceListReady, batchNamesReady, batchPlacementReady, copiedDimensionsReady,
                 staleSelectionRemoved, countHidden, titleBorderless, plusRemoved, controlsPlaced, pinRotated,
                 itemsCentered, horizontalControlsReady, shortcutRecorderReady, shortcutMatchingReady,
                 carbonModifiersReady, normalNameFocusReady, newDrawerNameFocusReady, keyboardRenameReady,
