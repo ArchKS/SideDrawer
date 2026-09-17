@@ -1,4 +1,4 @@
-// ai coding: 验证多收纳盒直接选择列表、菜单快捷键及既有功能 2026/09/17: 10:55
+// ai coding: 验证隐藏数量、完整尺寸复制、批量新建及既有功能 2026/09/17: 11:17
 #define main SideDrawerProductMain
 #import "../Sources/SideDrawer/main.m"
 #undef main
@@ -34,6 +34,26 @@ static NSInteger SDCountViewsOfClass(NSView *view, Class viewClass) {
     return count;
 }
 
+static NSButton *SDButtonWithTitle(NSView *view, NSString *title) {
+    if ([view isKindOfClass:NSButton.class] && [((NSButton *)view).title isEqualToString:title]) return (NSButton *)view;
+    for (NSView *subview in view.subviews) {
+        NSButton *button = SDButtonWithTitle(subview, title);
+        if (button) return button;
+    }
+    return nil;
+}
+
+static NSTextField *SDTextFieldContaining(NSView *view, NSString *text) {
+    if ([view isKindOfClass:NSTextField.class] && [((NSTextField *)view).stringValue containsString:text]) {
+        return (NSTextField *)view;
+    }
+    for (NSView *subview in view.subviews) {
+        NSTextField *field = SDTextFieldContaining(subview, text);
+        if (field) return field;
+    }
+    return nil;
+}
+
 int main(void) {
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -63,10 +83,7 @@ int main(void) {
         content.frame = NSMakeRect(0, 0, 95, 430);
         [content layoutSubtreeIfNeeded];
         NSTextField *nameField = [content valueForKey:@"nameField"];
-        NSTextField *countLabel = [content valueForKey:@"countLabel"];
-        NSRect nameRect = [nameField.superview convertRect:nameField.frame toView:content];
-        NSRect countRect = [countLabel.superview convertRect:countLabel.frame toView:content];
-        BOOL titleOnOneLine = fabs(NSMidY(nameRect) - NSMidY(countRect)) < 2.0;
+        BOOL countHidden = SDTextFieldContaining(content, @"6 项") == nil;
         BOOL titleBorderless = !nameField.isBordered && !nameField.isBezeled &&
             nameField.focusRingType == NSFocusRingTypeNone;
         NSButton *pinButton = SDButtonWithHelp(content, @"固定抽屉");
@@ -207,6 +224,7 @@ int main(void) {
         [menuDelegate configureMainMenu];
         NSMenu *drawerMenu = SDMenuItemWithTitle(NSApp.mainMenu, @"收纳盒").submenu;
         NSMenuItem *menuNew = SDMenuItemWithTitle(drawerMenu, @"新建收纳盒");
+        NSMenuItem *menuBatchNew = SDMenuItemWithTitle(drawerMenu, @"批量新建收纳盒…");
         NSMenuItem *menuSave = SDMenuItemWithTitle(drawerMenu, @"保存当前收纳盒为文件夹…");
         NSMenuItem *menuSelectAll = SDMenuItemWithTitle(drawerMenu, @"全选当前收纳盒文件");
         NSMenuItem *menuDelete = SDMenuItemWithTitle(drawerMenu, @"将所选项目移到废纸篓");
@@ -216,15 +234,67 @@ int main(void) {
             (menuNew.keyEquivalentModifierMask & NSEventModifierFlagCommand) != 0 &&
             (menuSave.keyEquivalentModifierMask & NSEventModifierFlagCommand) != 0 &&
             (menuSelectAll.keyEquivalentModifierMask & NSEventModifierFlagCommand) != 0 &&
-            menuDelete.keyEquivalent.length == 1 && menuDelete.keyEquivalentModifierMask == 0;
+            menuDelete.keyEquivalent.length == 1 && menuDelete.keyEquivalentModifierMask == 0 &&
+            menuBatchNew != nil;
+        NSArray<NSString *> *batchNames = [menuDelegate drawerNamesFromBatchInput:@" a， b,c ,, "];
+        BOOL batchNamesReady = [batchNames isEqualToArray:@[@"a", @"b", @"c"]];
+        [store updateDrawerID:drawerID edge:SDEdgeBottom position:0.4];
+        [store updateDrawerID:drawerID length:712 forEdge:SDEdgeTop];
+        [store updateDrawerID:drawerID length:528 forEdge:SDEdgeRight];
+        NSString *clonedDrawerID = [store addDrawerWithName:@"尺寸副本"
+                             copyingDimensionsFromDrawerID:drawerID
+                                                      error:&error];
+        NSDictionary *clonedDrawer = [store drawerForID:clonedDrawerID];
+        BOOL copiedDimensionsReady = [clonedDrawer[@"name"] isEqualToString:@"尺寸副本"] &&
+            [clonedDrawer[@"edge"] isEqualToString:SDEdgeBottom] &&
+            [clonedDrawer[@"horizontalLength"] doubleValue] == 712 &&
+            [clonedDrawer[@"verticalLength"] doubleValue] == 528;
+        if (clonedDrawerID) [store deleteDrawerID:clonedDrawerID error:nil];
+        [store updateDrawerID:drawerID edge:SDEdgeRight position:0.5];
         NSArray<NSDictionary *> *choiceDrawers = @[
             @{@"id": @"drawer-a", @"name": @"项目 A"},
             @{@"id": @"drawer-b", @"name": @"项目 B"},
             @{@"id": @"drawer-c", @"name": @"项目 C"}
         ];
-        NSScrollView *choiceList = [menuDelegate drawerChoiceListForDrawers:choiceDrawers];
-        BOOL directChoiceListReady = SDCountViewsOfClass(choiceList, NSButton.class) == 3 &&
-            SDCountViewsOfClass(choiceList, NSPopUpButton.class) == 0;
+        SDDrawerChoicePanel *choicePanel = [menuDelegate drawerChoicePanelForDrawers:choiceDrawers itemCount:2];
+        NSView *choiceContent = choicePanel.contentView;
+        NSEvent *optionTwo = [NSEvent keyEventWithType:NSEventTypeKeyDown
+                                              location:NSZeroPoint
+                                         modifierFlags:NSEventModifierFlagOption
+                                             timestamp:0
+                                          windowNumber:choicePanel.windowNumber
+                                               context:nil
+                                            characters:@"2"
+                           charactersIgnoringModifiers:@"2"
+                                             isARepeat:NO
+                                               keyCode:19];
+        NSEvent *commandThree = [NSEvent keyEventWithType:NSEventTypeKeyDown
+                                                   location:NSZeroPoint
+                                              modifierFlags:NSEventModifierFlagCommand
+                                                  timestamp:0
+                                               windowNumber:choicePanel.windowNumber
+                                                    context:nil
+                                                 characters:@"3"
+                                charactersIgnoringModifiers:@"3"
+                                                  isARepeat:NO
+                                                    keyCode:20];
+        BOOL optionNumberReady = [choicePanel performKeyEquivalent:optionTwo] &&
+            [[menuDelegate valueForKey:@"selectedDrawerChoiceID"] isEqualToString:@"drawer-b"];
+        [menuDelegate setValue:nil forKey:@"selectedDrawerChoiceID"];
+        BOOL commandNumberReady = [choicePanel performKeyEquivalent:commandThree] &&
+            [[menuDelegate valueForKey:@"selectedDrawerChoiceID"] isEqualToString:@"drawer-c"];
+        BOOL directChoiceListReady = choicePanel.frame.size.width <= 168 &&
+            SDCountViewsOfClass(choiceContent, NSButton.class) == 4 &&
+            SDCountViewsOfClass(choiceContent, NSPopUpButton.class) == 0 &&
+            SDCountViewsOfClass(choiceContent, NSImageView.class) == 1 &&
+            SDButtonWithTitle(choiceContent, @"1  项目 A") != nil &&
+            SDButtonWithTitle(choiceContent, @"2  项目 B") != nil &&
+            SDButtonWithTitle(choiceContent, @"3  项目 C") != nil &&
+            SDButtonWithTitle(choiceContent, @"取消") != nil &&
+            SDButtonWithTitle(choiceContent, @"确定") == nil &&
+            SDTextFieldContaining(choiceContent, @"选择收纳箱") != nil &&
+            SDTextFieldContaining(choiceContent, @"2 个项目") != nil &&
+            optionNumberReady && commandNumberReady;
         [store updateDrawerID:drawerID length:500 forEdge:SDEdgeRight];
         SDDrawerPanelController *verticalController = [[SDDrawerPanelController alloc] initWithStore:store drawerID:drawerID];
         BOOL verticalSizeReady = verticalController.panel.frame.size.width == 95 &&
@@ -292,20 +362,20 @@ int main(void) {
         BOOL staleSelectionRemoved = [[content valueForKey:@"selectedPaths"] count] == 5;
 
         if (allItemsSelected && visibleSelected && pileSelected && batchDragReady && shortcutHandled &&
-            staleSelectionRemoved && titleOnOneLine && titleBorderless && plusRemoved && controlsPlaced && pinRotated &&
+            staleSelectionRemoved && countHidden && titleBorderless && plusRemoved && controlsPlaced && pinRotated &&
             itemsCentered && horizontalControlsReady && shortcutRecorderReady && shortcutMatchingReady &&
             carbonModifiersReady && dropAnimationReady && verticalSizeReady && horizontalSizeReady &&
             verticalResizeDirectionReady && normalNameFocusReady && newDrawerNameFocusReady &&
             verticalEdgeSnapReady && horizontalEdgeSnapReady && keyboardRenameReady && menuShortcutsReady &&
-            directChoiceListReady) {
+            directChoiceListReady && batchNamesReady && copiedDimensionsReady) {
             fprintf(stdout, "SIDEDRAWER_SELECTION_TEST_OK\n");
             return 0;
         }
         fprintf(stderr,
-                "SIDEDRAWER_SELECTION_TEST_FAILED all=%d visible=%d pile=%d batch=%d shortcut=%d menu=%d directChoice=%d stale=%d title=%d borderless=%d plus=%d controls=%d pin=%d centered=%d horizontalControls=%d recorder=%d matcher=%d carbon=%d normalFocus=%d renameFocus=%d keyboardRename=%d verticalSnap=%d horizontalSnap=%d items=(%.1f,%.1f,%.1f,%.1f) drop=%d vertical=%d horizontal=%d resizeDirection=%d resizeHandle=(%.1f,%.1f,%.1f,%.1f)\n",
+                "SIDEDRAWER_SELECTION_TEST_FAILED all=%d visible=%d pile=%d batch=%d shortcut=%d menu=%d directChoice=%d batchNames=%d copiedSize=%d stale=%d countHidden=%d borderless=%d plus=%d controls=%d pin=%d centered=%d horizontalControls=%d recorder=%d matcher=%d carbon=%d normalFocus=%d renameFocus=%d keyboardRename=%d verticalSnap=%d horizontalSnap=%d items=(%.1f,%.1f,%.1f,%.1f) drop=%d vertical=%d horizontal=%d resizeDirection=%d resizeHandle=(%.1f,%.1f,%.1f,%.1f)\n",
                 allItemsSelected, visibleSelected, pileSelected, batchDragReady, shortcutHandled, menuShortcutsReady,
-                directChoiceListReady,
-                staleSelectionRemoved, titleOnOneLine, titleBorderless, plusRemoved, controlsPlaced, pinRotated,
+                directChoiceListReady, batchNamesReady, copiedDimensionsReady,
+                staleSelectionRemoved, countHidden, titleBorderless, plusRemoved, controlsPlaced, pinRotated,
                 itemsCentered, horizontalControlsReady, shortcutRecorderReady, shortcutMatchingReady,
                 carbonModifiersReady, normalNameFocusReady, newDrawerNameFocusReady, keyboardRenameReady,
                 verticalEdgeSnapReady, horizontalEdgeSnapReady,

@@ -49,6 +49,10 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
 - (NSDictionary *)drawerForID:(NSString *)drawerID;
 - (NSArray<NSURL *> *)itemsForDrawerID:(NSString *)drawerID;
 - (NSString *)addDrawer:(NSError **)error;
+// ai coding: 声明可指定名称并复制现有抽屉尺寸的新建接口 2026/09/17: 11:14
+- (NSString *)addDrawerWithName:(NSString *)requestedName
+ copyingDimensionsFromDrawerID:(NSString *)sourceDrawerID
+                          error:(NSError **)error;
 - (BOOL)renameDrawerID:(NSString *)drawerID name:(NSString *)name error:(NSError **)error;
 - (BOOL)deleteDrawerID:(NSString *)drawerID error:(NSError **)error;
 - (BOOL)importURLs:(NSArray<NSURL *> *)urls drawerID:(NSString *)drawerID error:(NSError **)error;
@@ -123,25 +127,42 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
 }
 
 - (NSString *)addDrawer:(NSError **)error {
+    return [self addDrawerWithName:nil copyingDimensionsFromDrawerID:nil error:error];
+}
+
+// ai coding: 新建抽屉时支持自定义名称，并沿用指定抽屉的方向和完整尺寸 2026/09/17: 11:17
+- (NSString *)addDrawerWithName:(NSString *)requestedName
+ copyingDimensionsFromDrawerID:(NSString *)sourceDrawerID
+                          error:(NSError **)error {
     NSMutableSet<NSString *> *names = [NSMutableSet set];
     for (NSDictionary *drawer in _mutableDrawers) [names addObject:drawer[@"name"]];
-    NSInteger number = _mutableDrawers.count + 1;
-    NSString *name = [NSString stringWithFormat:@"新抽屉 %ld", (long)number];
-    while ([names containsObject:name]) {
-        number += 1;
+    NSString *name = [self sanitizedName:requestedName ?: @""];
+    if (name.length == 0 && requestedName.length > 0) {
+        if (error) *error = SDError(9, @"收纳盒名称不能为空。");
+        return nil;
+    }
+    if (name.length == 0) {
+        NSInteger number = _mutableDrawers.count + 1;
         name = [NSString stringWithFormat:@"新抽屉 %ld", (long)number];
+        while ([names containsObject:name]) {
+            number += 1;
+            name = [NSString stringWithFormat:@"新抽屉 %ld", (long)number];
+        }
     }
     NSInteger slot = _mutableDrawers.count % 5;
-    NSString *edge = ((_mutableDrawers.count / 5) % 2 == 0) ? SDEdgeRight : SDEdgeLeft;
-    // ai coding: 为新抽屉保存横向和纵向的独立长度，便于用户手动调整后保持尺寸 2026/09/17: 08:40
+    NSDictionary *sourceDrawer = sourceDrawerID.length > 0 ? [self drawerForID:sourceDrawerID] : nil;
+    NSString *defaultEdge = ((_mutableDrawers.count / 5) % 2 == 0) ? SDEdgeRight : SDEdgeLeft;
+    NSString *edge = sourceDrawer[@"edge"] ?: defaultEdge;
+    NSNumber *horizontalLength = sourceDrawer[@"horizontalLength"] ?: @580;
+    NSNumber *verticalLength = sourceDrawer[@"verticalLength"] ?: @430;
     NSMutableDictionary *drawer = [@{
         @"id": NSUUID.UUID.UUIDString,
         @"name": name,
         @"edge": edge,
         @"position": @(0.05 + slot * 0.2),
         @"locked": @NO,
-        @"horizontalLength": @580,
-        @"verticalLength": @430
+        @"horizontalLength": horizontalLength,
+        @"verticalLength": verticalLength
     } mutableCopy];
     [_mutableDrawers addObject:drawer];
     if (![NSFileManager.defaultManager createDirectoryAtURL:[self directoryForDrawer:drawer]
@@ -750,7 +771,7 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
 }
 @end
 
-// ai coding: 隐藏三个操作图标并控制名称输入框仅在新建时自动聚焦 2026/09/17: 10:33
+// ai coding: 隐藏数量和三个操作图标，并控制名称输入框仅在新建时自动聚焦 2026/09/17: 11:14
 @interface SDDrawerContentView : NSVisualEffectView <NSDraggingDestination, NSTextFieldDelegate>
 @property(nonatomic, copy) void (^deleteHandler)(NSString *drawerID);
 @property(nonatomic, copy) void (^newDrawerHandler)(void);
@@ -775,7 +796,6 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     NSString *_drawerID;
     NSString *_edge;
     NSTextField *_nameField;
-    NSTextField *_countLabel;
     NSStackView *_itemStack;
     NSButton *_lockButton;
     BOOL _locked;
@@ -850,18 +870,12 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     _nameField.font = [NSFont boldSystemFontOfSize:11];
     _nameField.lineBreakMode = NSLineBreakByTruncatingTail;
     _nameField.delegate = self;
-    _countLabel = [NSTextField labelWithString:@"0 项"];
-    _countLabel.font = [NSFont systemFontOfSize:9];
-    _countLabel.textColor = NSColor.secondaryLabelColor;
     NSStackView *titleRow = [[NSStackView alloc] initWithFrame:NSZeroRect];
     titleRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     titleRow.alignment = NSLayoutAttributeCenterY;
-    titleRow.spacing = 3;
     titleRow.translatesAutoresizingMaskIntoConstraints = NO;
     [titleRow addArrangedSubview:_nameField];
-    [titleRow addArrangedSubview:_countLabel];
     [_nameField setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
-    [_countLabel setContentCompressionResistancePriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
     [_nameField.widthAnchor constraintGreaterThanOrEqualToConstant:horizontal ? 62 : 20].active = YES;
     [self addSubview:titleRow];
 
@@ -982,7 +996,6 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     NSMutableSet<NSString *> *existingPaths = [NSMutableSet setWithCapacity:items.count];
     for (NSURL *url in items) [existingPaths addObject:url.path];
     [_selectedPaths intersectSet:existingPaths];
-    _countLabel.stringValue = [NSString stringWithFormat:@"%ld 项", (long)items.count];
     for (NSView *view in _itemStack.arrangedSubviews.copy) {
         [_itemStack removeArrangedSubview:view];
         [view removeFromSuperview];
@@ -1624,6 +1637,40 @@ static NSString *SDShortcutDisplayString(CGEventFlags modifiers, NSString *keyNa
 }
 @end
 
+// ai coding: 让窄版收纳盒选择面板支持 Option 或 Command 加数字直接选择 2026/09/17: 11:11
+@interface SDDrawerChoicePanel : NSPanel
+@property(nonatomic, copy) void (^numberSelectionHandler)(NSInteger index);
+@end
+
+@implementation SDDrawerChoicePanel
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return NO; }
+
+- (BOOL)handleNumberShortcut:(NSEvent *)event {
+    if (event.type != NSEventTypeKeyDown) return NO;
+    NSEventModifierFlags modifiers = event.modifierFlags &
+        (NSEventModifierFlagCommand | NSEventModifierFlagOption |
+         NSEventModifierFlagControl | NSEventModifierFlagShift);
+    if (modifiers != NSEventModifierFlagOption && modifiers != NSEventModifierFlagCommand) return NO;
+    NSString *characters = event.charactersIgnoringModifiers;
+    if (characters.length != 1) return NO;
+    unichar character = [characters characterAtIndex:0];
+    if (character < '1' || character > '9') return NO;
+    if (self.numberSelectionHandler) self.numberSelectionHandler(character - '1');
+    return YES;
+}
+
+- (BOOL)performKeyEquivalent:(NSEvent *)event {
+    if ([self handleNumberShortcut:event]) return YES;
+    return [super performKeyEquivalent:event];
+}
+
+- (void)keyDown:(NSEvent *)event {
+    if ([self handleNumberShortcut:event]) return;
+    [super keyDown:event];
+}
+@end
+
 @interface SDAppDelegate : NSObject <NSApplicationDelegate, NSMenuItemValidation>
 - (void)handleGlobalMoveHotKey;
 - (BOOL)shouldHandleGlobalMoveHotKey;
@@ -1631,14 +1678,20 @@ static NSString *SDShortcutDisplayString(CGEventFlags modifiers, NSString *keyNa
 // ai coding: 声明标准应用菜单和访达定位入口 2026/09/17: 09:06
 - (void)configureMainMenu;
 - (void)revealApplication:(id)sender;
+// ai coding: 声明批量解析名称及批量新建菜单操作 2026/09/17: 11:14
+- (NSArray<NSString *> *)drawerNamesFromBatchInput:(NSString *)input;
+- (void)batchCreateDrawers:(id)sender;
 // ai coding: 声明快捷键录制、展示和多抽屉目标选择入口 2026/09/17: 09:19
 - (void)loadMoveShortcut;
 - (void)showShortcutConfiguration:(id)sender;
 - (void)moveURLs:(NSArray<NSURL *> *)urls toDrawerID:(NSString *)drawerID;
 - (void)chooseDrawerAndMoveURLs:(NSArray<NSURL *> *)urls;
-// ai coding: 声明多收纳盒直接选择列表的构建与点击处理接口 2026/09/17: 10:55
-- (NSScrollView *)drawerChoiceListForDrawers:(NSArray<NSDictionary *> *)drawers;
+// ai coding: 声明半宽多收纳盒选择面板及鼠标、数字快捷键和取消处理接口 2026/09/17: 11:11
+- (SDDrawerChoicePanel *)drawerChoicePanelForDrawers:(NSArray<NSDictionary *> *)drawers
+                                           itemCount:(NSInteger)itemCount;
+- (void)selectDrawerAtIndex:(NSInteger)index;
 - (void)selectDrawerFromList:(NSButton *)sender;
+- (void)cancelDrawerChoice:(id)sender;
 @end
 
 // ai coding: 将用户录制的修饰键转换为 Carbon 全局热键格式 2026/09/17: 09:44
@@ -1681,6 +1734,8 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     NSString *_moveShortcutKeyName;
     // ai coding: 保存最后激活的收纳盒标识以路由菜单操作 2026/09/17: 10:47
     NSString *_activeDrawerID;
+    // ai coding: 保存快捷键选择面板和目标映射以支持点击即移动 2026/09/17: 11:05
+    SDDrawerChoicePanel *_drawerChoicePanel;
     NSArray<NSString *> *_drawerChoiceIDs;
     NSString *_selectedDrawerChoiceID;
 }
@@ -1837,10 +1892,15 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     _statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
     _statusItem.button.image = [NSImage imageWithSystemSymbolName:@"rectangle.stack.fill" accessibilityDescription:@"SideDrawer"];
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@"SideDrawer"];
-    // ai coding: 在状态菜单显示常用收纳盒操作及对应的原生快捷键 2026/09/17: 10:47
+    // ai coding: 在状态菜单增加批量新建，并保留常用操作及原生快捷键 2026/09/17: 11:14
     NSMenuItem *newDrawer = [[NSMenuItem alloc] initWithTitle:@"新建收纳盒" action:@selector(createDrawer:) keyEquivalent:@"n"];
     newDrawer.target = self;
     [menu addItem:newDrawer];
+    NSMenuItem *batchNewDrawer = [[NSMenuItem alloc] initWithTitle:@"批量新建收纳盒…"
+                                                            action:@selector(batchCreateDrawers:)
+                                                     keyEquivalent:@""];
+    batchNewDrawer.target = self;
+    [menu addItem:batchNewDrawer];
     NSMenuItem *saveDrawer = [[NSMenuItem alloc] initWithTitle:@"保存当前收纳盒为文件夹…"
                                                        action:@selector(saveCurrentDrawer:)
                                                 keyEquivalent:@"s"];
@@ -1887,7 +1947,7 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     _statusItem.menu = menu;
 }
 
-// ai coding: 在标准菜单增加带快捷键标识的新建、保存、全选和删除操作 2026/09/17: 10:47
+// ai coding: 在标准菜单增加批量新建，并保留带快捷键标识的常用操作 2026/09/17: 11:14
 - (void)configureMainMenu {
     NSMenu *mainMenu = [[NSMenu alloc] initWithTitle:@"MainMenu"];
     NSMenuItem *applicationItem = [[NSMenuItem alloc] initWithTitle:@"SideDrawer" action:nil keyEquivalent:@""];
@@ -1923,6 +1983,11 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
                                                keyEquivalent:@"n"];
     newDrawer.target = self;
     [drawerMenu addItem:newDrawer];
+    NSMenuItem *batchNewDrawer = [[NSMenuItem alloc] initWithTitle:@"批量新建收纳盒…"
+                                                            action:@selector(batchCreateDrawers:)
+                                                     keyEquivalent:@""];
+    batchNewDrawer.target = self;
+    [drawerMenu addItem:batchNewDrawer];
     NSMenuItem *saveDrawer = [[NSMenuItem alloc] initWithTitle:@"保存当前收纳盒为文件夹…"
                                                        action:@selector(saveCurrentDrawer:)
                                                 keyEquivalent:@"s"];
@@ -1995,8 +2060,11 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
 
 - (void)createDrawer:(id)sender {
     NSError *error = nil;
-    // ai coding: 记录新抽屉标识，并在创建完成后直接聚焦其名称输入框 2026/09/17: 10:33
-    NSString *drawerID = [_store addDrawer:&error];
+    SDDrawerPanelController *sourceController = [self activeDrawerController];
+    // ai coding: 单个新建复制当前激活抽屉尺寸，并在完成后直接聚焦名称 2026/09/17: 11:14
+    NSString *drawerID = [_store addDrawerWithName:nil
+                    copyingDimensionsFromDrawerID:sourceController.drawerID
+                                             error:&error];
     if (!drawerID) {
         [self showError:error window:nil];
         return;
@@ -2005,6 +2073,54 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     dispatch_async(dispatch_get_main_queue(), ^{
         [self->_controllers[drawerID] beginRenaming];
     });
+}
+
+// ai coding: 将中英文逗号分隔的输入清理为非空收纳盒名称列表 2026/09/17: 11:14
+- (NSArray<NSString *> *)drawerNamesFromBatchInput:(NSString *)input {
+    NSCharacterSet *separators = [NSCharacterSet characterSetWithCharactersInString:@",，"];
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (NSString *component in [input componentsSeparatedByCharactersInSet:separators]) {
+        NSString *name = [component stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (name.length > 0) [names addObject:name];
+    }
+    return names;
+}
+
+// ai coding: 通过菜单输入多个名称，并按当前抽屉尺寸一次创建全部收纳盒 2026/09/17: 11:14
+- (void)batchCreateDrawers:(id)sender {
+    [NSApp activateIgnoringOtherApps:YES];
+    NSTextField *input = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 280, 26)];
+    input.placeholderString = @"例如：a,b,c";
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"批量新建收纳盒";
+    alert.informativeText = @"输入名称并用逗号分隔；中文逗号和英文逗号效果相同。";
+    alert.accessoryView = input;
+    [alert addButtonWithTitle:@"新建"];
+    [alert addButtonWithTitle:@"取消"];
+    alert.window.initialFirstResponder = input;
+    dispatch_async(dispatch_get_main_queue(), ^{ [alert.window makeFirstResponder:input]; });
+    if ([alert runModal] != NSAlertFirstButtonReturn) return;
+
+    NSArray<NSString *> *names = [self drawerNamesFromBatchInput:input.stringValue];
+    if (names.count == 0) {
+        [self showError:SDError(10, @"请至少输入一个收纳盒名称。") window:nil];
+        return;
+    }
+    NSString *sourceDrawerID = [self activeDrawerController].drawerID;
+    NSMutableArray<NSString *> *createdDrawerIDs = [NSMutableArray arrayWithCapacity:names.count];
+    NSError *error = nil;
+    for (NSString *name in names) {
+        NSString *drawerID = [_store addDrawerWithName:name
+                        copyingDimensionsFromDrawerID:sourceDrawerID
+                                                 error:&error];
+        if (!drawerID) break;
+        [createdDrawerIDs addObject:drawerID];
+    }
+    if (createdDrawerIDs.count > 0) {
+        _activeDrawerID = createdDrawerIDs.lastObject;
+        [self syncPanels];
+    }
+    if (error) [self showError:error window:nil];
 }
 
 - (void)deleteDrawerID:(NSString *)drawerID {
@@ -2067,55 +2183,154 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     }
 }
 
-// ai coding: 多个收纳盒时直接列出全部目标，点击选项即完成选择 2026/09/17: 10:55
+// ai coding: 多个收纳盒时显示半宽面板并支持鼠标或组合键立即选择 2026/09/17: 11:11
 - (void)chooseDrawerAndMoveURLs:(NSArray<NSURL *> *)urls {
     [NSApp activateIgnoringOtherApps:YES];
-    NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = @"选择收纳箱";
-    alert.informativeText = [NSString stringWithFormat:@"点击目标，将 Finder 中选中的 %ld 个项目立即移动过去：", (long)urls.count];
     _selectedDrawerChoiceID = nil;
-    alert.accessoryView = [self drawerChoiceListForDrawers:_store.drawers];
-    [alert addButtonWithTitle:@"取消"];
-    NSModalResponse response = [alert runModal];
+    _drawerChoicePanel = [self drawerChoicePanelForDrawers:_store.drawers itemCount:urls.count];
+    [_drawerChoicePanel center];
+    [_drawerChoicePanel makeKeyAndOrderFront:nil];
+    NSModalResponse response = [NSApp runModalForWindow:_drawerChoicePanel];
+    [_drawerChoicePanel orderOut:nil];
     NSString *drawerID = [_selectedDrawerChoiceID copy];
+    _drawerChoicePanel = nil;
     _drawerChoiceIDs = nil;
     _selectedDrawerChoiceID = nil;
     if (response != NSModalResponseOK) return;
     if (drawerID.length > 0) [self moveURLs:urls toDrawerID:drawerID];
 }
 
-- (NSScrollView *)drawerChoiceListForDrawers:(NSArray<NSDictionary *> *)drawers {
-    CGFloat rowHeight = 36;
-    CGFloat documentHeight = MAX(rowHeight, drawers.count * rowHeight);
-    CGFloat visibleHeight = MIN(documentHeight, 324);
-    SDFlippedView *document = [[SDFlippedView alloc] initWithFrame:NSMakeRect(0, 0, 300, documentHeight)];
+// ai coding: 将选择面板宽度减半、恢复原生控件颜色并纵向排列头部 2026/09/17: 11:11
+- (SDDrawerChoicePanel *)drawerChoicePanelForDrawers:(NSArray<NSDictionary *> *)drawers
+                                           itemCount:(NSInteger)itemCount {
+    CGFloat panelWidth = 168;
+    CGFloat contentInset = 12;
+    CGFloat innerWidth = panelWidth - contentInset * 2;
+    CGFloat rowHeight = 40;
+    CGFloat rowGap = 6;
+    NSUInteger visibleRows = MIN(drawers.count, (NSUInteger)6);
+    CGFloat visibleListHeight = visibleRows * rowHeight + (visibleRows > 0 ? (visibleRows - 1) * rowGap : 0);
+    CGFloat documentHeight = drawers.count * rowHeight + (drawers.count > 0 ? (drawers.count - 1) * rowGap : 0);
+    CGFloat cancelHeight = 36;
+    CGFloat headerHeight = 146;
+    CGFloat listBottom = contentInset + cancelHeight + 10;
+    CGFloat headerBottom = listBottom + visibleListHeight + 14;
+    CGFloat panelHeight = headerBottom + headerHeight + contentInset;
+
+    SDDrawerChoicePanel *panel = [[SDDrawerChoicePanel alloc]
+        initWithContentRect:NSMakeRect(0, 0, panelWidth, panelHeight)
+                  styleMask:NSWindowStyleMaskBorderless
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    panel.opaque = NO;
+    panel.backgroundColor = NSColor.clearColor;
+    panel.hasShadow = YES;
+    panel.level = NSFloatingWindowLevel;
+    panel.hidesOnDeactivate = NO;
+    panel.animationBehavior = NSWindowAnimationBehaviorUtilityWindow;
+    panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                               NSWindowCollectionBehaviorFullScreenAuxiliary;
+
+    NSVisualEffectView *background = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, panelWidth, panelHeight)];
+    background.material = NSVisualEffectMaterialPopover;
+    background.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+    background.state = NSVisualEffectStateActive;
+    background.wantsLayer = YES;
+    background.layer.cornerRadius = 20;
+    background.layer.masksToBounds = YES;
+    panel.contentView = background;
+
+    NSImageView *iconView = [[NSImageView alloc]
+        initWithFrame:NSMakeRect((panelWidth - 42) / 2, headerBottom + 100, 42, 42)];
+    iconView.image = NSApp.applicationIconImage ?: [NSImage imageNamed:NSImageNameApplicationIcon];
+    iconView.imageScaling = NSImageScaleProportionallyUpOrDown;
+    [background addSubview:iconView];
+
+    NSTextField *titleLabel = [NSTextField labelWithString:@"选择收纳箱"];
+    titleLabel.frame = NSMakeRect(contentInset, headerBottom + 69, innerWidth, 24);
+    titleLabel.font = [NSFont systemFontOfSize:17 weight:NSFontWeightSemibold];
+    titleLabel.textColor = NSColor.labelColor;
+    titleLabel.alignment = NSTextAlignmentCenter;
+    [background addSubview:titleLabel];
+
+    NSTextField *descriptionLabel = [NSTextField wrappingLabelWithString:
+        [NSString stringWithFormat:@"点击目标，将 Finder 中选中的 %ld 个项目立即移动过去：", (long)itemCount]];
+    descriptionLabel.frame = NSMakeRect(contentInset, headerBottom + 2, innerWidth, 60);
+    descriptionLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightRegular];
+    descriptionLabel.textColor = NSColor.secondaryLabelColor;
+    descriptionLabel.alignment = NSTextAlignmentCenter;
+    descriptionLabel.maximumNumberOfLines = 4;
+    [background addSubview:descriptionLabel];
+
+    SDFlippedView *document = [[SDFlippedView alloc] initWithFrame:NSMakeRect(0, 0, innerWidth, MAX(rowHeight, documentHeight))];
     NSMutableArray<NSString *> *drawerIDs = [NSMutableArray arrayWithCapacity:drawers.count];
     [drawers enumerateObjectsUsingBlock:^(NSDictionary *drawer, NSUInteger index, BOOL *stop __unused) {
         NSString *drawerID = drawer[@"id"] ?: @"";
         [drawerIDs addObject:drawerID];
-        NSButton *button = [NSButton buttonWithTitle:drawer[@"name"] ?: @"未命名收纳盒"
+        NSString *drawerName = drawer[@"name"] ?: @"未命名收纳盒";
+        NSString *buttonTitle = index < 9
+            ? [NSString stringWithFormat:@"%lu  %@", (unsigned long)index + 1, drawerName]
+            : drawerName;
+        NSButton *button = [NSButton buttonWithTitle:buttonTitle
                                               target:self
                                               action:@selector(selectDrawerFromList:)];
         button.tag = (NSInteger)index;
         button.alignment = NSTextAlignmentLeft;
+        button.bordered = YES;
         button.bezelStyle = NSBezelStyleRounded;
-        button.image = [NSImage imageWithSystemSymbolName:@"shippingbox" accessibilityDescription:@"收纳盒"];
+        button.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
+        button.image = [[NSImage imageWithSystemSymbolName:@"shippingbox" accessibilityDescription:@"收纳盒"]
+            imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:14
+                                                                                         weight:NSFontWeightRegular]];
         button.imagePosition = NSImageLeading;
-        button.frame = NSMakeRect(0, index * rowHeight, 300, 32);
+        button.contentTintColor = NSColor.labelColor;
+        button.cell.lineBreakMode = NSLineBreakByTruncatingTail;
+        button.toolTip = index < 9
+            ? [NSString stringWithFormat:@"⌥%lu 或 ⌘%lu：%@", (unsigned long)index + 1,
+                                                        (unsigned long)index + 1, drawerName]
+            : drawerName;
+        button.frame = NSMakeRect(0, index * (rowHeight + rowGap), innerWidth, rowHeight);
         [document addSubview:button];
     }];
     _drawerChoiceIDs = drawerIDs;
-    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 300, visibleHeight)];
+    NSScrollView *scroll = [[NSScrollView alloc]
+        initWithFrame:NSMakeRect(contentInset, listBottom, innerWidth, visibleListHeight)];
     scroll.drawsBackground = NO;
-    scroll.hasVerticalScroller = documentHeight > visibleHeight;
+    scroll.borderType = NSNoBorder;
+    scroll.hasVerticalScroller = documentHeight > visibleListHeight;
+    scroll.scrollerStyle = NSScrollerStyleOverlay;
+    scroll.autohidesScrollers = YES;
     scroll.documentView = document;
-    return scroll;
+    [background addSubview:scroll];
+
+    NSButton *cancelButton = [NSButton buttonWithTitle:@"取消" target:self action:@selector(cancelDrawerChoice:)];
+    cancelButton.frame = NSMakeRect(contentInset, contentInset, innerWidth, cancelHeight);
+    cancelButton.bordered = YES;
+    cancelButton.bezelStyle = NSBezelStyleRounded;
+    cancelButton.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+    cancelButton.contentTintColor = NSColor.labelColor;
+    cancelButton.keyEquivalent = @"\e";
+    [background addSubview:cancelButton];
+    __weak typeof(self) weakSelf = self;
+    panel.numberSelectionHandler = ^(NSInteger index) {
+        [weakSelf selectDrawerAtIndex:index];
+    };
+    return panel;
+}
+
+// ai coding: 统一处理鼠标和数字快捷键选择，并保留取消按钮与 Escape 关闭 2026/09/17: 11:11
+- (void)selectDrawerAtIndex:(NSInteger)index {
+    if (index < 0 || index >= (NSInteger)_drawerChoiceIDs.count) return;
+    _selectedDrawerChoiceID = [_drawerChoiceIDs[(NSUInteger)index] copy];
+    if (NSApp.modalWindow) [NSApp stopModalWithCode:NSModalResponseOK];
 }
 
 - (void)selectDrawerFromList:(NSButton *)sender {
-    if (sender.tag < 0 || sender.tag >= (NSInteger)_drawerChoiceIDs.count) return;
-    _selectedDrawerChoiceID = [_drawerChoiceIDs[(NSUInteger)sender.tag] copy];
-    [NSApp stopModalWithCode:NSModalResponseOK];
+    [self selectDrawerAtIndex:sender.tag];
+}
+
+- (void)cancelDrawerChoice:(id)sender {
+    [NSApp stopModalWithCode:NSModalResponseCancel];
 }
 
 - (void)moveURLs:(NSArray<NSURL *> *)urls toDrawerID:(NSString *)drawerID {

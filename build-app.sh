@@ -1,5 +1,5 @@
 #!/bin/zsh
-# ai coding: 构建使用 Carbon 原生全局快捷键的 SideDrawer 2026/09/17: 09:44
+# ai coding: 构建包含隐藏数量、尺寸复制和批量新建的 SideDrawer 2026/09/17: 11:14
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
