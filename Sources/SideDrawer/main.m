@@ -1031,7 +1031,8 @@ static NSURL *SDWritePastedImage(NSPasteboard *pasteboard, NSError **error) {
         if (error) *error = SDError(11, @"剪贴板中的图片无法读取。");
         return nil;
     }
-    NSString *name = [NSString stringWithFormat:@"粘贴图片-%@.png", NSUUID.UUID.UUIDString.lowercaseString];
+    // ai coding: 将图片粘贴文件前缀统一改为英文 paste 便于识别 2026/09/17: 14:44
+    NSString *name = [NSString stringWithFormat:@"paste-%@.png", NSUUID.UUID.UUIDString.lowercaseString];
     NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:name]];
     if (![pngData writeToURL:url options:NSDataWritingAtomic error:error]) return nil;
     return url;
@@ -1040,7 +1041,8 @@ static NSURL *SDWritePastedImage(NSPasteboard *pasteboard, NSError **error) {
 // ai coding: 将剪贴板文本按 Markdown 或纯文本保存为临时文件供收纳盒接管 2026/09/17: 14:10
 static NSURL *SDWritePastedText(NSString *text, BOOL markdown, NSError **error) {
     NSString *extension = markdown ? @"md" : @"txt";
-    NSString *name = [NSString stringWithFormat:@"粘贴文本-%@.%@", NSUUID.UUID.UUIDString.lowercaseString, extension];
+    // ai coding: 将文本粘贴文件前缀统一改为英文 paste 便于识别 2026/09/17: 14:44
+    NSString *name = [NSString stringWithFormat:@"paste-%@.%@", NSUUID.UUID.UUIDString.lowercaseString, extension];
     NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:name]];
     NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
     if (![data writeToURL:url options:NSDataWritingAtomic error:error]) return nil;
