@@ -1,4 +1,4 @@
-// ai coding: 验证顶部关闭按钮、键盘改名、零间距吸附及既有功能 2026/09/17: 10:40
+// ai coding: 验证菜单快捷键、关闭按钮、键盘改名及既有功能 2026/09/17: 10:47
 #define main SideDrawerProductMain
 #import "../Sources/SideDrawer/main.m"
 #undef main
@@ -17,6 +17,13 @@ static NSView *SDViewWithToolTip(NSView *view, NSString *toolTip) {
     for (NSView *subview in view.subviews) {
         NSView *match = SDViewWithToolTip(subview, toolTip);
         if (match) return match;
+    }
+    return nil;
+}
+
+static NSMenuItem *SDMenuItemWithTitle(NSMenu *menu, NSString *title) {
+    for (NSMenuItem *item in menu.itemArray) {
+        if ([item.title isEqualToString:title]) return item;
     }
     return nil;
 }
@@ -190,6 +197,20 @@ int main(void) {
             [panel performKeyEquivalent:commandS] &&
             [panel performKeyEquivalent:deleteKey] &&
             commandACount == 1 && commandNCount == 1 && commandSCount == 1 && deleteCount == 1;
+        SDAppDelegate *menuDelegate = [[SDAppDelegate alloc] init];
+        [menuDelegate configureMainMenu];
+        NSMenu *drawerMenu = SDMenuItemWithTitle(NSApp.mainMenu, @"收纳盒").submenu;
+        NSMenuItem *menuNew = SDMenuItemWithTitle(drawerMenu, @"新建收纳盒");
+        NSMenuItem *menuSave = SDMenuItemWithTitle(drawerMenu, @"保存当前收纳盒为文件夹…");
+        NSMenuItem *menuSelectAll = SDMenuItemWithTitle(drawerMenu, @"全选当前收纳盒文件");
+        NSMenuItem *menuDelete = SDMenuItemWithTitle(drawerMenu, @"将所选项目移到废纸篓");
+        BOOL menuShortcutsReady = [menuNew.keyEquivalent isEqualToString:@"n"] &&
+            [menuSave.keyEquivalent isEqualToString:@"s"] &&
+            [menuSelectAll.keyEquivalent isEqualToString:@"a"] &&
+            (menuNew.keyEquivalentModifierMask & NSEventModifierFlagCommand) != 0 &&
+            (menuSave.keyEquivalentModifierMask & NSEventModifierFlagCommand) != 0 &&
+            (menuSelectAll.keyEquivalentModifierMask & NSEventModifierFlagCommand) != 0 &&
+            menuDelete.keyEquivalent.length == 1 && menuDelete.keyEquivalentModifierMask == 0;
         [store updateDrawerID:drawerID length:500 forEdge:SDEdgeRight];
         SDDrawerPanelController *verticalController = [[SDDrawerPanelController alloc] initWithStore:store drawerID:drawerID];
         BOOL verticalSizeReady = verticalController.panel.frame.size.width == 95 &&
@@ -261,13 +282,13 @@ int main(void) {
             itemsCentered && horizontalControlsReady && shortcutRecorderReady && shortcutMatchingReady &&
             carbonModifiersReady && dropAnimationReady && verticalSizeReady && horizontalSizeReady &&
             verticalResizeDirectionReady && normalNameFocusReady && newDrawerNameFocusReady &&
-            verticalEdgeSnapReady && horizontalEdgeSnapReady && keyboardRenameReady) {
+            verticalEdgeSnapReady && horizontalEdgeSnapReady && keyboardRenameReady && menuShortcutsReady) {
             fprintf(stdout, "SIDEDRAWER_SELECTION_TEST_OK\n");
             return 0;
         }
         fprintf(stderr,
-                "SIDEDRAWER_SELECTION_TEST_FAILED all=%d visible=%d pile=%d batch=%d shortcut=%d stale=%d title=%d borderless=%d plus=%d controls=%d pin=%d centered=%d horizontalControls=%d recorder=%d matcher=%d carbon=%d normalFocus=%d renameFocus=%d keyboardRename=%d verticalSnap=%d horizontalSnap=%d items=(%.1f,%.1f,%.1f,%.1f) drop=%d vertical=%d horizontal=%d resizeDirection=%d resizeHandle=(%.1f,%.1f,%.1f,%.1f)\n",
-                allItemsSelected, visibleSelected, pileSelected, batchDragReady, shortcutHandled,
+                "SIDEDRAWER_SELECTION_TEST_FAILED all=%d visible=%d pile=%d batch=%d shortcut=%d menu=%d stale=%d title=%d borderless=%d plus=%d controls=%d pin=%d centered=%d horizontalControls=%d recorder=%d matcher=%d carbon=%d normalFocus=%d renameFocus=%d keyboardRename=%d verticalSnap=%d horizontalSnap=%d items=(%.1f,%.1f,%.1f,%.1f) drop=%d vertical=%d horizontal=%d resizeDirection=%d resizeHandle=(%.1f,%.1f,%.1f,%.1f)\n",
+                allItemsSelected, visibleSelected, pileSelected, batchDragReady, shortcutHandled, menuShortcutsReady,
                 staleSelectionRemoved, titleOnOneLine, titleBorderless, plusRemoved, controlsPlaced, pinRotated,
                 itemsCentered, horizontalControlsReady, shortcutRecorderReady, shortcutMatchingReady,
                 carbonModifiersReady, normalNameFocusReady, newDrawerNameFocusReady, keyboardRenameReady,

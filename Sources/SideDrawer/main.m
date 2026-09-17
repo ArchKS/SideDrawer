@@ -1290,10 +1290,16 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
 @property(nonatomic, readonly) SDDrawerPanel *panel;
 @property(nonatomic, copy) void (^deleteHandler)(NSString *drawerID);
 @property(nonatomic, copy) void (^newDrawerHandler)(void);
+// ai coding: 暴露抽屉激活状态和菜单操作接口 2026/09/17: 10:47
+@property(nonatomic, copy) void (^activationHandler)(NSString *drawerID);
 - (instancetype)initWithStore:(SDDrawerStore *)store drawerID:(NSString *)drawerID;
 - (void)show;
 - (void)reloadContent;
 - (void)beginRenaming;
+- (void)selectAllItems;
+- (void)saveDrawerAsFolder;
+- (void)deleteSelectedItems;
+- (BOOL)isEditingDrawerName;
 @end
 
 @implementation SDDrawerPanelController {
@@ -1379,6 +1385,12 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     [_contentView reloadContent];
 }
 
+// ai coding: 暴露当前抽屉的菜单操作并报告键盘焦点状态 2026/09/17: 10:47
+- (void)selectAllItems { [_contentView selectAllItems]; }
+- (void)saveDrawerAsFolder { [_contentView saveDrawerAsFolder]; }
+- (void)deleteSelectedItems { [_contentView deleteSelectedItems]; }
+- (BOOL)isEditingDrawerName { return [_panel isEditingDrawerName]; }
+
 - (void)beginRenaming {
     [NSApp activateIgnoringOtherApps:YES];
     [_panel orderFrontRegardless];
@@ -1393,6 +1405,11 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     if (_adjustingFrame) return;
     [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(snapToNearestEdge) object:nil];
     [self performSelector:@selector(snapToNearestEdge) withObject:nil afterDelay:0.22];
+}
+
+// ai coding: 抽屉成为当前窗口时记录其标识供菜单命令使用 2026/09/17: 10:47
+- (void)windowDidBecomeKey:(NSNotification *)notification {
+    if (self.activationHandler) self.activationHandler(_drawerID);
 }
 
 - (void)windowDidResize:(NSNotification *)notification {
@@ -1607,7 +1624,7 @@ static NSString *SDShortcutDisplayString(CGEventFlags modifiers, NSString *keyNa
 }
 @end
 
-@interface SDAppDelegate : NSObject <NSApplicationDelegate>
+@interface SDAppDelegate : NSObject <NSApplicationDelegate, NSMenuItemValidation>
 - (void)handleGlobalMoveHotKey;
 - (BOOL)shouldHandleGlobalMoveHotKey;
 - (BOOL)matchesMoveShortcutKeyCode:(CGKeyCode)keyCode modifiers:(CGEventFlags)modifiers;
@@ -1659,6 +1676,8 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     CGKeyCode _moveShortcutKeyCode;
     CGEventFlags _moveShortcutModifiers;
     NSString *_moveShortcutKeyName;
+    // ai coding: 保存最后激活的收纳盒标识以路由菜单操作 2026/09/17: 10:47
+    NSString *_activeDrawerID;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
@@ -1695,14 +1714,21 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
             controller = [[SDDrawerPanelController alloc] initWithStore:_store drawerID:drawerID];
             controller.deleteHandler = ^(NSString *identifier) { [weakSelf deleteDrawerID:identifier]; };
             controller.newDrawerHandler = ^{ [weakSelf createDrawer:nil]; };
+            // ai coding: 记录最后激活的收纳盒，供顶部菜单操作准确定位目标 2026/09/17: 10:47
+            controller.activationHandler = ^(NSString *identifier) {
+                SDAppDelegate *strongSelf = weakSelf;
+                if (strongSelf) strongSelf->_activeDrawerID = [identifier copy];
+            };
             _controllers[drawerID] = controller;
         }
+        if (!_activeDrawerID) _activeDrawerID = [drawerID copy];
         [controller show];
     }
     for (NSString *drawerID in _controllers.allKeys.copy) {
         if (![activeIDs containsObject:drawerID]) {
             [_controllers[drawerID].panel close];
             [_controllers removeObjectForKey:drawerID];
+            if ([_activeDrawerID isEqualToString:drawerID]) _activeDrawerID = nil;
         }
     }
 }
@@ -1806,9 +1832,29 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     _statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
     _statusItem.button.image = [NSImage imageWithSystemSymbolName:@"rectangle.stack.fill" accessibilityDescription:@"SideDrawer"];
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@"SideDrawer"];
-    NSMenuItem *newDrawer = [[NSMenuItem alloc] initWithTitle:@"新建抽屉" action:@selector(createDrawer:) keyEquivalent:@"n"];
+    // ai coding: 在状态菜单显示常用收纳盒操作及对应的原生快捷键 2026/09/17: 10:47
+    NSMenuItem *newDrawer = [[NSMenuItem alloc] initWithTitle:@"新建收纳盒" action:@selector(createDrawer:) keyEquivalent:@"n"];
     newDrawer.target = self;
     [menu addItem:newDrawer];
+    NSMenuItem *saveDrawer = [[NSMenuItem alloc] initWithTitle:@"保存当前收纳盒为文件夹…"
+                                                       action:@selector(saveCurrentDrawer:)
+                                                keyEquivalent:@"s"];
+    saveDrawer.target = self;
+    [menu addItem:saveDrawer];
+    NSMenuItem *selectAll = [[NSMenuItem alloc] initWithTitle:@"全选当前收纳盒文件"
+                                                      action:@selector(selectAllCurrentDrawer:)
+                                               keyEquivalent:@"a"];
+    selectAll.target = self;
+    [menu addItem:selectAll];
+    unichar deleteCharacter = NSDeleteCharacter;
+    NSString *deleteKey = [NSString stringWithCharacters:&deleteCharacter length:1];
+    NSMenuItem *deleteItems = [[NSMenuItem alloc] initWithTitle:@"将所选项目移到废纸篓"
+                                                        action:@selector(deleteSelectedInCurrentDrawer:)
+                                                 keyEquivalent:deleteKey];
+    deleteItems.keyEquivalentModifierMask = 0;
+    deleteItems.target = self;
+    [menu addItem:deleteItems];
+    [menu addItem:NSMenuItem.separatorItem];
     // ai coding: 在菜单栏展示免辅助功能权限的原生全局快捷键状态 2026/09/17: 09:44
     _shortcutConfigurationItem = [[NSMenuItem alloc] initWithTitle:@"设置移动快捷键…"
                                                             action:@selector(showShortcutConfiguration:)
@@ -1818,10 +1864,10 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     _shortcutStatusItem = [[NSMenuItem alloc] initWithTitle:@"快捷键已就绪" action:nil keyEquivalent:@""];
     [menu addItem:_shortcutStatusItem];
     [self refreshShortcutStatusItem];
-    NSMenuItem *showAll = [[NSMenuItem alloc] initWithTitle:@"显示全部抽屉" action:@selector(showAll:) keyEquivalent:@"s"];
+    NSMenuItem *showAll = [[NSMenuItem alloc] initWithTitle:@"显示全部抽屉" action:@selector(showAll:) keyEquivalent:@""];
     showAll.target = self;
     [menu addItem:showAll];
-    NSMenuItem *hideAll = [[NSMenuItem alloc] initWithTitle:@"隐藏全部抽屉" action:@selector(hideAll:) keyEquivalent:@"h"];
+    NSMenuItem *hideAll = [[NSMenuItem alloc] initWithTitle:@"隐藏全部抽屉" action:@selector(hideAll:) keyEquivalent:@""];
     hideAll.target = self;
     [menu addItem:hideAll];
     NSMenuItem *reveal = [[NSMenuItem alloc] initWithTitle:@"在访达中显示 SideDrawer"
@@ -1836,7 +1882,7 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     _statusItem.menu = menu;
 }
 
-// ai coding: 增加标准应用菜单，使程序坞、菜单栏和 Command+Q 都能退出或定位应用 2026/09/17: 09:06
+// ai coding: 在标准菜单增加带快捷键标识的新建、保存、全选和删除操作 2026/09/17: 10:47
 - (void)configureMainMenu {
     NSMenu *mainMenu = [[NSMenu alloc] initWithTitle:@"MainMenu"];
     NSMenuItem *applicationItem = [[NSMenuItem alloc] initWithTitle:@"SideDrawer" action:nil keyEquivalent:@""];
@@ -1864,7 +1910,73 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     [applicationMenu addItem:quit];
     applicationItem.submenu = applicationMenu;
     [mainMenu addItem:applicationItem];
+
+    NSMenuItem *drawerMenuItem = [[NSMenuItem alloc] initWithTitle:@"收纳盒" action:nil keyEquivalent:@""];
+    NSMenu *drawerMenu = [[NSMenu alloc] initWithTitle:@"收纳盒"];
+    NSMenuItem *newDrawer = [[NSMenuItem alloc] initWithTitle:@"新建收纳盒"
+                                                      action:@selector(createDrawer:)
+                                               keyEquivalent:@"n"];
+    newDrawer.target = self;
+    [drawerMenu addItem:newDrawer];
+    NSMenuItem *saveDrawer = [[NSMenuItem alloc] initWithTitle:@"保存当前收纳盒为文件夹…"
+                                                       action:@selector(saveCurrentDrawer:)
+                                                keyEquivalent:@"s"];
+    saveDrawer.target = self;
+    [drawerMenu addItem:saveDrawer];
+    [drawerMenu addItem:NSMenuItem.separatorItem];
+    NSMenuItem *selectAll = [[NSMenuItem alloc] initWithTitle:@"全选当前收纳盒文件"
+                                                      action:@selector(selectAllCurrentDrawer:)
+                                               keyEquivalent:@"a"];
+    selectAll.target = self;
+    [drawerMenu addItem:selectAll];
+    unichar deleteCharacter = NSDeleteCharacter;
+    NSString *deleteKey = [NSString stringWithCharacters:&deleteCharacter length:1];
+    NSMenuItem *deleteItems = [[NSMenuItem alloc] initWithTitle:@"将所选项目移到废纸篓"
+                                                        action:@selector(deleteSelectedInCurrentDrawer:)
+                                                 keyEquivalent:deleteKey];
+    deleteItems.keyEquivalentModifierMask = 0;
+    deleteItems.target = self;
+    [drawerMenu addItem:deleteItems];
+    drawerMenuItem.submenu = drawerMenu;
+    [mainMenu addItem:drawerMenuItem];
     NSApp.mainMenu = mainMenu;
+}
+
+// ai coding: 将菜单命令路由到最后激活的收纳盒并避免编辑名称时误删文件 2026/09/17: 10:47
+- (SDDrawerPanelController *)activeDrawerController {
+    SDDrawerPanelController *controller = _activeDrawerID ? _controllers[_activeDrawerID] : nil;
+    if (controller) return controller;
+    for (SDDrawerPanelController *candidate in _controllers.allValues) {
+        if (candidate.panel.isKeyWindow) return candidate;
+    }
+    return _controllers.allValues.firstObject;
+}
+
+- (void)selectAllCurrentDrawer:(id)sender {
+    SDDrawerPanelController *controller = [self activeDrawerController];
+    [controller show];
+    [controller selectAllItems];
+}
+
+- (void)saveCurrentDrawer:(id)sender {
+    SDDrawerPanelController *controller = [self activeDrawerController];
+    [controller show];
+    [controller saveDrawerAsFolder];
+}
+
+- (void)deleteSelectedInCurrentDrawer:(id)sender {
+    [[self activeDrawerController] deleteSelectedItems];
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem *)menuItem {
+    SEL action = menuItem.action;
+    if (action == @selector(selectAllCurrentDrawer:) || action == @selector(saveCurrentDrawer:) ||
+        action == @selector(deleteSelectedInCurrentDrawer:)) {
+        SDDrawerPanelController *controller = [self activeDrawerController];
+        if (!controller) return NO;
+        if (action == @selector(deleteSelectedInCurrentDrawer:) && [controller isEditingDrawerName]) return NO;
+    }
+    return YES;
 }
 
 - (void)revealApplication:(id)sender {
