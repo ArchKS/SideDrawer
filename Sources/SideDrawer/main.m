@@ -1,6 +1,8 @@
 // ai coding: 增加可发现的快捷键权限入口并仅在授权后监听 Finder 的 Command+M 2026/09/16: 20:36
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
+// ai coding: 引入原生 Quick Look 以支持文件悬停预览 2026/09/17: 13:50
+#import <QuickLookUI/QuickLookUI.h>
 // ai coding: 引入 Carbon 原生热键接口以避免辅助功能键盘监听失效 2026/09/17: 09:44
 #import <Carbon/Carbon.h>
 // ai coding: 引入 QuartzCore 以实现拖入落点的脉冲动画 2026/09/17: 08:41
@@ -473,7 +475,7 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
 }
 @end
 
-// ai coding: 压缩横向文件项，为右侧纵向操作按钮留出空间 2026/09/17: 09:19
+// ai coding: 压缩横向文件项并增加文件悬停预览能力 2026/09/17: 13:50
 @interface SDFileTileView : NSView <NSDraggingSource>
 @property(nonatomic, getter=isSelected) BOOL selected;
 @property(nonatomic, readonly) NSURL *url;
@@ -493,6 +495,9 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     void (^_selectionHandler)(NSURL *, BOOL);
     NSArray<NSURL *> *(^_dragURLsProvider)(NSURL *);
     BOOL _selected;
+    BOOL _isDirectory;
+    NSPanel *_previewPanel;
+    QLPreviewView *_previewView;
     BOOL _draggedAfterMouseDown;
     BOOL _collapseSelectionOnMouseUp;
 }
@@ -509,6 +514,9 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     _moveHandler = [moveHandler copy];
     _selectionHandler = [selectionHandler copy];
     _dragURLsProvider = [dragURLsProvider copy];
+    BOOL isDirectory = NO;
+    [NSFileManager.defaultManager fileExistsAtPath:url.path isDirectory:&isDirectory];
+    _isDirectory = isDirectory;
     self.wantsLayer = YES;
     self.layer.cornerRadius = 9;
     self.layer.backgroundColor = [NSColor.controlBackgroundColor colorWithAlphaComponent:0.38].CGColor;
@@ -522,6 +530,14 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     _label.lineBreakMode = NSLineBreakByTruncatingMiddle;
     _label.font = [NSFont systemFontOfSize:_iconOnTop ? 9 : 10 weight:NSFontWeightMedium];
     [self addSubview:_label];
+    // ai coding: 监听文件卡片悬停并延迟显示 Quick Look，避免拖拽时误触预览 2026/09/17: 13:50
+    NSTrackingArea *trackingArea = [[NSTrackingArea alloc]
+        initWithRect:NSZeroRect
+              options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                      NSTrackingInVisibleRect
+                owner:self
+             userInfo:nil];
+    [self addTrackingArea:trackingArea];
     return self;
 }
 
@@ -539,6 +555,82 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
 
 - (NSSize)intrinsicContentSize { return _iconOnTop ? NSMakeSize(72, 42) : NSMakeSize(79, 46); }
 
+// ai coding: 创建紧凑磨砂 Quick Look 预览窗口并根据抽屉位置自动避让屏幕边缘 2026/09/17: 13:50
+- (void)showHoverPreview {
+    if (_isDirectory || ![NSFileManager.defaultManager fileExistsAtPath:_url.path]) return;
+    NSScreen *screen = self.window.screen ?: NSScreen.mainScreen;
+    if (!screen) return;
+    if (!_previewPanel) {
+        _previewPanel = [[NSPanel alloc]
+            initWithContentRect:NSMakeRect(0, 0, 320, 240)
+                      styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+                        backing:NSBackingStoreBuffered
+                          defer:NO];
+        _previewPanel.opaque = NO;
+        _previewPanel.backgroundColor = NSColor.clearColor;
+        _previewPanel.hasShadow = YES;
+        _previewPanel.level = NSStatusWindowLevel;
+        _previewPanel.floatingPanel = YES;
+        _previewPanel.hidesOnDeactivate = NO;
+        _previewPanel.becomesKeyOnlyIfNeeded = YES;
+        _previewPanel.ignoresMouseEvents = YES;
+        _previewPanel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                            NSWindowCollectionBehaviorFullScreenAuxiliary;
+        NSVisualEffectView *background = [[NSVisualEffectView alloc]
+            initWithFrame:NSMakeRect(0, 0, 320, 240)];
+        background.material = NSVisualEffectMaterialPopover;
+        background.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+        background.state = NSVisualEffectStateActive;
+        background.wantsLayer = YES;
+        background.layer.cornerRadius = 14;
+        background.layer.masksToBounds = YES;
+        _previewView = [[QLPreviewView alloc]
+            initWithFrame:NSMakeRect(8, 8, 304, 224)
+                    style:QLPreviewViewStyleCompact];
+        _previewView.autostarts = NO;
+        [background addSubview:_previewView];
+        _previewPanel.contentView = background;
+    }
+    _previewView.previewItem = _url;
+    NSRect tileInWindow = [self convertRect:self.bounds toView:nil];
+    NSRect tileRect = [self.window convertRectToScreen:tileInWindow];
+    NSRect visible = screen.visibleFrame;
+    NSSize previewSize = _previewPanel.frame.size;
+    NSPoint origin = NSMakePoint(NSMidX(tileRect) - previewSize.width / 2,
+                                 NSMaxY(tileRect) + 8);
+    if (_iconOnTop) {
+        if (NSMinY(tileRect) > NSMidY(visible)) origin.y = NSMinY(tileRect) - previewSize.height - 8;
+    } else if (NSMinX(tileRect) > NSMidX(visible)) {
+        origin.x = NSMinX(tileRect) - previewSize.width - 8;
+        origin.y = NSMidY(tileRect) - previewSize.height / 2;
+    } else {
+        origin.x = NSMaxX(tileRect) + 8;
+        origin.y = NSMidY(tileRect) - previewSize.height / 2;
+    }
+    origin.x = MAX(NSMinX(visible) + 8, MIN(origin.x, NSMaxX(visible) - previewSize.width - 8));
+    origin.y = MAX(NSMinY(visible) + 8, MIN(origin.y, NSMaxY(visible) - previewSize.height - 8));
+    [_previewPanel setFrame:NSMakeRect(origin.x, origin.y, previewSize.width, previewSize.height) display:NO];
+    [_previewPanel orderFrontRegardless];
+}
+
+// ai coding: 鼠标离开文件卡片或开始拖拽时立即关闭悬停预览 2026/09/17: 13:50
+- (void)hideHoverPreview {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(showHoverPreview) object:nil];
+    [_previewPanel orderOut:nil];
+}
+
+- (void)mouseEntered:(NSEvent *)event {
+    [super mouseEntered:event];
+    if (_isDirectory) return;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(showHoverPreview) object:nil];
+    [self performSelector:@selector(showHoverPreview) withObject:nil afterDelay:0.22];
+}
+
+- (void)mouseExited:(NSEvent *)event {
+    [super mouseExited:event];
+    [self hideHoverPreview];
+}
+
 - (void)layout {
     [super layout];
     if (_iconOnTop) {
@@ -554,6 +646,7 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
 
 - (void)mouseDown:(NSEvent *)event {
+    [self hideHoverPreview];
     [NSApp activateIgnoringOtherApps:YES];
     [self.window makeKeyWindow];
     _draggedAfterMouseDown = NO;
@@ -582,6 +675,7 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
 - (BOOL)mouseDownCanMoveWindow { return NO; }
 
 - (void)mouseDragged:(NSEvent *)event {
+    [self hideHoverPreview];
     _draggedAfterMouseDown = YES;
     NSArray<NSURL *> *urls = _dragURLsProvider ? _dragURLsProvider(_url) : @[_url];
     if (urls.count == 0) return;

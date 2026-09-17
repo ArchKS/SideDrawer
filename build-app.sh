@@ -1,5 +1,5 @@
 #!/bin/zsh
-# ai coding: 构建快捷键即时移动并异步选择相邻项目的 SideDrawer 2026/09/17: 13:30
+# ai coding: 构建包含 Quick Look 悬停预览的 SideDrawer 2026/09/17: 13:50
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
@@ -18,6 +18,7 @@ clang -fobjc-arc -fblocks -fmodules \
     -framework ApplicationServices \
     -framework Carbon \
     -framework QuartzCore \
+    -framework QuickLookUI \
     "Sources/SideDrawer/main.m" \
     -o "$CONTENTS_PATH/MacOS/SideDrawer"
 cp "Resources/Info.plist" "$CONTENTS_PATH/Info.plist"

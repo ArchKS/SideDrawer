@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- ai coding: 更新底部吸附和窄尺寸版本号 2026/09/17: 13:43 -->
+<!-- ai coding: 更新文件悬停预览版本号 2026/09/17: 13:53 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -22,9 +22,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-	<string>0.5.9</string>
+	<string>0.5.10</string>
     <key>CFBundleVersion</key>
-	<string>28</string>
+	<string>29</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>LSUIElement</key>
