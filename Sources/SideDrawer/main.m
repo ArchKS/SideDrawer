@@ -1815,9 +1815,10 @@ static NSString *SDShortcutDisplayString(CGEventFlags modifiers, NSString *keyNa
 - (void)loadMoveShortcut;
 - (void)showShortcutConfiguration:(id)sender;
 - (BOOL)moveURLs:(NSArray<NSURL *> *)urls toDrawerID:(NSString *)drawerID;
-// ai coding: 声明移动后定位 Finder 相邻项目的快捷键流程接口 2026/09/17: 11:51
+// ai coding: 声明移动后异步刷新 Finder 并定位相邻项目的快捷键流程接口 2026/09/17: 13:22
 - (BOOL)chooseDrawerAndMoveURLs:(NSArray<NSURL *> *)urls;
-- (NSString *)finderNeighborPathForCurrentSelection;
+- (NSArray<NSDictionary *> *)finderSelectionSnapshotForURLs:(NSArray<NSURL *> *)urls;
+- (NSString *)finderNeighborPathForSelectionSnapshot:(NSArray<NSDictionary *> *)snapshots;
 - (void)selectFinderItemAtPath:(NSString *)path;
 // ai coding: 声明支持方向键、回车及数字快捷键的多收纳盒选择接口 2026/09/17: 11:23
 - (SDDrawerChoicePanel *)drawerChoicePanelForDrawers:(NSArray<NSDictionary *> *)drawers
@@ -2334,7 +2335,7 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     _shortcutStatusItem.enabled = failed;
 }
 
-// ai coding: 快捷键移动后优先选中原 Finder 容器中的下一个或上一个项目 2026/09/17: 11:51
+// ai coding: 快捷键先完成文件移动，再异步刷新 Finder 并选中相邻项目 2026/09/17: 13:22
 - (void)handleGlobalMoveHotKey {
     if (_store.drawers.count == 0) return;
     NSString *source = @"tell application \"Finder\"\n"
@@ -2363,14 +2364,24 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
         NSBeep();
         return;
     }
-    NSString *neighborPath = [self finderNeighborPathForCurrentSelection];
+    NSArray<NSDictionary *> *selectionSnapshot = [self finderSelectionSnapshotForURLs:urls];
     BOOL moved = NO;
     if (_store.drawers.count == 1) {
         moved = [self moveURLs:urls toDrawerID:_store.drawers.firstObject[@"id"]];
     } else {
         moved = [self chooseDrawerAndMoveURLs:urls];
     }
-    if (moved && neighborPath.length > 0) [self selectFinderItemAtPath:neighborPath];
+    if (!moved) return;
+    NSArray<NSDictionary *> *movedSelectionSnapshot = [selectionSnapshot copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            NSString *neighborPath = [self finderNeighborPathForSelectionSnapshot:movedSelectionSnapshot];
+            if (neighborPath.length == 0) return;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self selectFinderItemAtPath:neighborPath];
+            });
+        }
+    });
 }
 
 // ai coding: 多个收纳盒选择目标后返回移动结果以便定位相邻 Finder 项目 2026/09/17: 11:51
@@ -2390,33 +2401,117 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     return [self moveURLs:urls toDrawerID:drawerID];
 }
 
-// ai coding: 在移动前按 Finder 容器顺序寻找选区后的下一个或前一个项目 2026/09/17: 11:51
-- (NSString *)finderNeighborPathForCurrentSelection {
-    NSString *source = @"tell application \"Finder\"\n"
-                        "set selectedItems to selection as list\n"
-                        "if (count selectedItems) is 0 then return \"\"\n"
-                        "set firstSelectedItem to item 1 of selectedItems\n"
-                        "set targetContainer to container of firstSelectedItem\n"
-                        "set containerItems to every item of targetContainer\n"
-                        "set minimumIndex to 2147483647\n"
-                        "set maximumIndex to 0\n"
-                        "repeat with selectedItemReference in selectedItems\n"
-                        "set selectedItem to contents of selectedItemReference\n"
-                        "if (container of selectedItem as text) is not (targetContainer as text) then return \"\"\n"
-                        "set currentIndex to index of selectedItem\n"
-                        "if currentIndex < minimumIndex then set minimumIndex to currentIndex\n"
-                        "if currentIndex > maximumIndex then set maximumIndex to currentIndex\n"
-                        "end repeat\n"
-                        "set candidateItem to missing value\n"
-                        "if maximumIndex < (count containerItems) then set candidateItem to item (maximumIndex + 1) of containerItems\n"
-                        "if candidateItem is missing value and minimumIndex > 1 then set candidateItem to item (minimumIndex - 1) of containerItems\n"
-                        "if candidateItem is missing value then return \"\"\n"
-                        "return POSIX path of (candidateItem as alias)\n"
-                        "end tell";
-    NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
-    NSDictionary *scriptError = nil;
-    NSAppleEventDescriptor *result = [script executeAndReturnError:&scriptError];
-    return result.stringValue ?: @"";
+// ai coding: 在移动前只读取本地文件属性快照，避免等待 Finder 排序脚本后才开始移动 2026/09/17: 13:22
+- (NSArray<NSDictionary *> *)finderSelectionSnapshotForURLs:(NSArray<NSURL *> *)urls {
+    NSArray<NSURLResourceKey> *keys = @[
+        NSURLNameKey, NSURLIsDirectoryKey, NSURLFileSizeKey,
+        NSURLContentModificationDateKey, NSURLCreationDateKey,
+        NSURLLocalizedTypeDescriptionKey
+    ];
+    NSMutableArray<NSDictionary *> *snapshots = [NSMutableArray arrayWithCapacity:urls.count];
+    for (NSURL *url in urls) {
+        NSURL *standardURL = url.URLByStandardizingPath;
+        NSDictionary<NSURLResourceKey, id> *values = [standardURL resourceValuesForKeys:keys error:nil];
+        NSString *path = standardURL.path;
+        NSString *name = values[NSURLNameKey] ?: standardURL.lastPathComponent ?: @"";
+        BOOL isDirectory = [values[NSURLIsDirectoryKey] boolValue];
+        NSString *kind = values[NSURLLocalizedTypeDescriptionKey];
+        if (kind.length == 0) kind = isDirectory ? @"文件夹" : (standardURL.pathExtension.length > 0 ? standardURL.pathExtension : @"文件");
+        [snapshots addObject:@{
+            @"path": path ?: @"",
+            @"directory": standardURL.URLByDeletingLastPathComponent.path ?: @"",
+            @"name": name,
+            @"kind": kind,
+            @"size": values[NSURLFileSizeKey] ?: @0,
+            @"modificationDate": values[NSURLContentModificationDateKey] ?: [NSDate distantPast],
+            @"creationDate": values[NSURLCreationDateKey] ?: [NSDate distantPast]
+        }];
+    }
+    return snapshots;
+}
+
+// ai coding: 移动后在后台刷新 Finder 并按当前视图规则计算下一个或上一个项目 2026/09/17: 13:22
+- (NSString *)finderNeighborPathForSelectionSnapshot:(NSArray<NSDictionary *> *)snapshots {
+    if (snapshots.count == 0) return @"";
+    NSString *sourceDirectoryPath = snapshots.firstObject[@"directory"];
+    if (sourceDirectoryPath.length == 0) return @"";
+    for (NSDictionary *snapshot in snapshots) {
+        if (![snapshot[@"directory"] isEqualToString:sourceDirectoryPath]) return @"";
+    }
+    NSString *sortSource = @"tell application \"Finder\"\n"
+                            "set sortKey to \"name\"\n"
+                            "set reversedOrder to false\n"
+                            "try\n"
+                            "set currentWindow to front Finder window\n"
+                            "try\n"
+                            "update every item of currentWindow\n"
+                            "end try\n"
+                            "set currentView to current view of currentWindow\n"
+                            "if currentView is list view then\n"
+                            "set sortColumnName to name of sort column of list view options of currentWindow as text\n"
+                            "if sortColumnName is \"modification date column\" then set sortKey to \"modificationDate\"\n"
+                            "if sortColumnName is \"creation date column\" then set sortKey to \"creationDate\"\n"
+                            "if sortColumnName is \"size column\" then set sortKey to \"size\"\n"
+                            "if sortColumnName is \"kind column\" then set sortKey to \"kind\"\n"
+                            "if (sort direction of sort column of list view options of currentWindow) is reversed then set reversedOrder to true\n"
+                            "else if currentView is icon view then\n"
+                            "set arrangementMode to arrangement of icon view options of currentWindow\n"
+                            "if arrangementMode is arranged by modification date then set sortKey to \"modificationDate\"\n"
+                            "if arrangementMode is arranged by creation date then set sortKey to \"creationDate\"\n"
+                            "if arrangementMode is arranged by size then set sortKey to \"size\"\n"
+                            "if arrangementMode is arranged by kind then set sortKey to \"kind\"\n"
+                            "end if\n"
+                            "end try\n"
+                            "return sortKey & \"|\" & (reversedOrder as text)\n"
+                            "end tell";
+    NSAppleScript *sortScript = [[NSAppleScript alloc] initWithSource:sortSource];
+    NSAppleEventDescriptor *sortResult = [sortScript executeAndReturnError:nil];
+    NSArray<NSString *> *sortParts = [sortResult.stringValue componentsSeparatedByString:@"|"];
+    NSString *sortKey = sortParts.firstObject.length > 0 ? sortParts.firstObject : @"name";
+    BOOL reversedOrder = sortParts.count > 1 && [sortParts[1] boolValue];
+    NSURL *directoryURL = [NSURL fileURLWithPath:sourceDirectoryPath isDirectory:YES];
+    NSArray<NSURLResourceKey> *keys = @[
+        NSURLNameKey, NSURLIsDirectoryKey, NSURLFileSizeKey,
+        NSURLContentModificationDateKey, NSURLCreationDateKey,
+        NSURLLocalizedTypeDescriptionKey
+    ];
+    NSArray<NSURL *> *directoryURLs = [NSFileManager.defaultManager
+        contentsOfDirectoryAtURL:directoryURL
+        includingPropertiesForKeys:keys
+        options:NSDirectoryEnumerationSkipsHiddenFiles
+        error:nil];
+    if (directoryURLs.count == 0) return @"";
+    NSMutableArray<NSDictionary *> *records = [[self finderSelectionSnapshotForURLs:directoryURLs] mutableCopy];
+    [records addObjectsFromArray:snapshots];
+    [records sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
+        NSComparisonResult result = NSOrderedSame;
+        if ([sortKey isEqualToString:@"size"]) {
+            unsigned long long leftSize = [left[@"size"] unsignedLongLongValue];
+            unsigned long long rightSize = [right[@"size"] unsignedLongLongValue];
+            result = leftSize < rightSize ? NSOrderedAscending : (leftSize > rightSize ? NSOrderedDescending : NSOrderedSame);
+        } else if ([sortKey isEqualToString:@"modificationDate"] || [sortKey isEqualToString:@"creationDate"]) {
+            result = [left[sortKey] compare:right[sortKey]];
+        } else {
+            result = [left[sortKey] localizedStandardCompare:right[sortKey]];
+        }
+        if (result == NSOrderedSame && ![sortKey isEqualToString:@"name"]) {
+            result = [left[@"name"] localizedStandardCompare:right[@"name"]];
+        }
+        if (result == NSOrderedSame) result = [left[@"path"] localizedStandardCompare:right[@"path"]];
+        return reversedOrder ? (NSComparisonResult)-result : result;
+    }];
+    NSSet<NSString *> *selectedPaths = [NSSet setWithArray:[snapshots valueForKey:@"path"]];
+    NSUInteger minimumPosition = NSNotFound;
+    NSUInteger maximumPosition = NSNotFound;
+    for (NSUInteger index = 0; index < records.count; index++) {
+        if (![selectedPaths containsObject:records[index][@"path"]]) continue;
+        if (minimumPosition == NSNotFound) minimumPosition = index;
+        maximumPosition = index;
+    }
+    if (maximumPosition == NSNotFound) return @"";
+    if (maximumPosition + 1 < records.count) return records[maximumPosition + 1][@"path"];
+    if (minimumPosition > 0) return records[minimumPosition - 1][@"path"];
+    return @"";
 }
 
 // ai coding: 移动成功后延迟选中 Finder 相邻项目，避免容器刷新覆盖选择 2026/09/17: 11:51

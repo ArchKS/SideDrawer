@@ -1,5 +1,5 @@
 #!/bin/zsh
-# ai coding: 构建包含 Finder 相邻项目自动选择的 SideDrawer 2026/09/17: 11:53
+# ai coding: 构建快捷键即时移动并异步选择相邻项目的 SideDrawer 2026/09/17: 13:30
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
