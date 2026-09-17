@@ -1,0 +1,14 @@
+[
+  {
+    "edge" : "right",
+    "id" : "40784495-F91D-4EF9-8B50-96040FEA20DD",
+    "name" : "收纳箱",
+    "position" : 0.5
+  },
+  {
+    "edge" : "right",
+    "id" : "EE77E32C-59CF-4923-A0ED-052FE3FC031E",
+    "name" : "新抽屉 2",
+    "position" : 0.25
+  }
+]

@@ -1,0 +1,1 @@
+SideDrawer Command+M Finder 选中项移动测试。

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ai coding: 更新顶部关闭按钮和新建键盘改名版本号 2026/09/17: 10:40 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleExecutable</key>
+    <string>SideDrawer</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.codex.sidedrawer</string>
+    <key>CFBundleIconFile</key>
+    <string>SideDrawer.icns</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>SideDrawer</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+	<string>0.4.7</string>
+    <key>CFBundleVersion</key>
+	<string>16</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <false/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>SideDrawer 需要读取 Finder 当前选中的文件或文件夹，以便通过自定义快捷键将其移入收纳箱。</string>
+</dict>
+</plist>
