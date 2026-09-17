@@ -12,6 +12,10 @@ static NSString * const SDEdgeRight = @"right";
 static NSString * const SDEdgeTop = @"top";
 static NSString * const SDEdgeBottom = @"bottom";
 
+// ai coding: 将抽屉长度下限缩为单个文件卡片沿抽屉方向的尺寸 2026/09/17: 13:41
+static const CGFloat SDHorizontalMinimumLength = 72.0;
+static const CGFloat SDVerticalMinimumLength = 46.0;
+
 static NSError *SDError(NSInteger code, NSString *message) {
     return [NSError errorWithDomain:SDErrorDomain code:code userInfo:@{NSLocalizedDescriptionKey: message}];
 }
@@ -408,7 +412,7 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
 - (BOOL)isFlipped { return YES; }
 @end
 
-// ai coding: 修正调节方向并移除长度调整时预留的屏幕边缘间距 2026/09/17: 10:38
+// ai coding: 修正调节方向并允许缩短到单个文件卡片尺寸 2026/09/17: 13:41
 @interface SDLengthResizeHandleView : NSView
 @property(nonatomic) BOOL horizontal;
 @end
@@ -436,12 +440,14 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     NSScreen *screen = self.window.screen ?: NSScreen.mainScreen;
     NSRect visible = screen ? screen.visibleFrame : NSMakeRect(0, 0, 1600, 1000);
     if (self.horizontal) {
-        CGFloat maximum = MAX(545, NSMaxX(visible) - NSMinX(frame));
-        frame.size.width = MAX(545, MIN(maximum, _startFrame.size.width + point.x - _startScreenPoint.x));
+        CGFloat maximum = MAX(SDHorizontalMinimumLength, NSMaxX(visible) - NSMinX(frame));
+        frame.size.width = MAX(SDHorizontalMinimumLength,
+                               MIN(maximum, _startFrame.size.width + point.x - _startScreenPoint.x));
     } else {
         CGFloat fixedTop = NSMaxY(_startFrame);
-        CGFloat maximum = MAX(315, fixedTop - NSMinY(visible));
-        frame.size.height = MAX(315, MIN(maximum, _startFrame.size.height - (point.y - _startScreenPoint.y)));
+        CGFloat maximum = MAX(SDVerticalMinimumLength, fixedTop - NSMinY(visible));
+        frame.size.height = MAX(SDVerticalMinimumLength,
+                                 MIN(maximum, _startFrame.size.height - (point.y - _startScreenPoint.y)));
         frame.origin.y = fixedTop - frame.size.height;
     }
     [self.window setFrame:frame display:YES];
@@ -911,7 +917,8 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     titleRow.translatesAutoresizingMaskIntoConstraints = NO;
     [titleRow addArrangedSubview:_nameField];
     [_nameField setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
-    [_nameField.widthAnchor constraintGreaterThanOrEqualToConstant:horizontal ? 62 : 20].active = YES;
+    // ai coding: 窄抽屉中允许名称压缩，为单个文件卡片保留可用宽度 2026/09/17: 13:41
+    [_nameField.widthAnchor constraintGreaterThanOrEqualToConstant:20].active = YES;
     [self addSubview:titleRow];
 
     _lockButton = [self iconButton:_locked ? @"pin.fill" : @"pin"
@@ -954,11 +961,16 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     ]];
     if (horizontal) {
         // ai coding: 隐藏操作图标后让横向文件区重新居中并释放右侧空间 2026/09/17: 10:33
+        // ai coding: 让单个文件卡片在极窄横向抽屉中仍能完整显示 2026/09/17: 13:41
+        NSLayoutConstraint *itemLeading = [_itemStack.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.leadingAnchor constant:0];
+        NSLayoutConstraint *itemTrailing = [_itemStack.trailingAnchor constraintLessThanOrEqualToAnchor:self.trailingAnchor constant:0];
+        itemLeading.priority = NSLayoutPriorityDefaultLow;
+        itemTrailing.priority = NSLayoutPriorityDefaultLow;
         [NSLayoutConstraint activateConstraints:@[
             [_itemStack.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
             [_itemStack.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
-            [_itemStack.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.leadingAnchor constant:7],
-            [_itemStack.trailingAnchor constraintLessThanOrEqualToAnchor:self.trailingAnchor constant:-14],
+            itemLeading,
+            itemTrailing,
             [resizeHandle.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
             [resizeHandle.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
             [resizeHandle.widthAnchor constraintEqualToConstant:9],
@@ -966,11 +978,16 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
         ]];
     } else {
         // ai coding: 将左右吸附抽屉的长度调节柄放到底部水平居中 2026/09/17: 10:36
+        // ai coding: 极短纵向抽屉优先保持文件卡片尺寸而允许与边缘控件重叠 2026/09/17: 13:41
+        NSLayoutConstraint *itemTop = [_itemStack.topAnchor constraintGreaterThanOrEqualToAnchor:self.topAnchor constant:0];
+        NSLayoutConstraint *itemBottom = [_itemStack.bottomAnchor constraintLessThanOrEqualToAnchor:self.bottomAnchor constant:0];
+        itemTop.priority = NSLayoutPriorityDefaultLow;
+        itemBottom.priority = NSLayoutPriorityDefaultLow;
         [NSLayoutConstraint activateConstraints:@[
             [_itemStack.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
             [_itemStack.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
-            [_itemStack.topAnchor constraintGreaterThanOrEqualToAnchor:self.topAnchor constant:28],
-            [_itemStack.bottomAnchor constraintLessThanOrEqualToAnchor:self.bottomAnchor constant:-14],
+            itemTop,
+            itemBottom,
             [resizeHandle.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
             [resizeHandle.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
             [resizeHandle.widthAnchor constraintEqualToConstant:34],
@@ -1486,11 +1503,12 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     NSScreen *screen = _panel.screen ?: NSScreen.mainScreen;
     if (!screen) return;
     NSRect visible = screen.visibleFrame;
+    NSRect fullFrame = screen.frame;
     NSRect frame = _panel.frame;
     NSDictionary<NSString *, NSNumber *> *distances = @{
         SDEdgeLeft: @(fabs(NSMinX(frame) - NSMinX(visible))),
         SDEdgeRight: @(fabs(NSMaxX(visible) - NSMaxX(frame))),
-        SDEdgeBottom: @(fabs(NSMinY(frame) - NSMinY(visible))),
+        SDEdgeBottom: @(fabs(NSMinY(frame) - NSMinY(fullFrame))),
         SDEdgeTop: @(fabs(NSMaxY(visible) - NSMaxY(frame)))
     };
     NSString *nearest = SDEdgeLeft;
@@ -1518,20 +1536,25 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
 - (NSSize)sizeForEdge:(NSString *)edge {
     NSDictionary *drawer = [_store drawerForID:_drawerID];
     if (SDEdgeIsHorizontal(edge)) {
-        CGFloat length = MAX(545, [drawer[@"horizontalLength"] doubleValue]);
+        CGFloat length = MAX(SDHorizontalMinimumLength, [drawer[@"horizontalLength"] doubleValue]);
         return NSMakeSize(length, 66);
     }
-    CGFloat length = MAX(315, [drawer[@"verticalLength"] doubleValue]);
+    CGFloat length = MAX(SDVerticalMinimumLength, [drawer[@"verticalLength"] doubleValue]);
     return NSMakeSize(95, length);
 }
 
-// ai coding: 将四向吸附间距改为零，使抽屉紧贴 macOS 可用屏幕边界 2026/09/17: 10:38
+// ai coding: 将四向吸附间距改为零并允许底部抽屉落到 Dock 所在的屏幕底边 2026/09/17: 13:41
 - (NSRect)frameForEdge:(NSString *)edge position:(CGFloat)position screen:(NSScreen *)screen {
     NSRect visible = screen.visibleFrame;
+    if ([edge isEqualToString:SDEdgeBottom]) {
+        NSRect fullFrame = screen.frame;
+        visible.origin.y = NSMinY(fullFrame);
+        visible.size.height = NSMaxY(fullFrame) - NSMinY(fullFrame);
+    }
     NSSize size = [self sizeForEdge:edge];
     CGFloat inset = 0;
-    if (SDEdgeIsHorizontal(edge)) size.width = MIN(size.width, MAX(545, visible.size.width - inset * 2));
-    else size.height = MIN(size.height, MAX(315, visible.size.height - inset * 2));
+    if (SDEdgeIsHorizontal(edge)) size.width = MIN(size.width, MAX(SDHorizontalMinimumLength, visible.size.width - inset * 2));
+    else size.height = MIN(size.height, MAX(SDVerticalMinimumLength, visible.size.height - inset * 2));
     NSRect frame = NSMakeRect(0, 0, size.width, size.height);
     if ([edge isEqualToString:SDEdgeLeft]) {
         frame.origin.x = NSMinX(visible) + inset;
