@@ -1,5 +1,5 @@
 #!/bin/zsh
-# ai coding: 构建包含隐藏数量、尺寸复制和批量新建的 SideDrawer 2026/09/17: 11:14
+# ai coding: 构建包含键盘选择、列表提示和四边散开的 SideDrawer 2026/09/17: 11:23
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"

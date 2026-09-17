@@ -1637,37 +1637,131 @@ static NSString *SDShortcutDisplayString(CGEventFlags modifiers, NSString *keyNa
 }
 @end
 
-// ai coding: 让窄版收纳盒选择面板支持 Option 或 Command 加数字直接选择 2026/09/17: 11:11
+// ai coding: 增加仅显示名称和右侧快捷键的收纳盒选项按钮 2026/09/17: 11:23
+@interface SDDrawerChoiceButton : NSButton
+@property(nonatomic, readonly) NSTextField *nameLabel;
+@property(nonatomic, readonly) NSTextField *shortcutLabel;
+- (instancetype)initWithName:(NSString *)name shortcut:(NSString *)shortcut;
+- (void)setKeyboardSelected:(BOOL)selected;
+@end
+
+@implementation SDDrawerChoiceButton
+- (instancetype)initWithName:(NSString *)name shortcut:(NSString *)shortcut {
+    self = [super initWithFrame:NSZeroRect];
+    if (!self) return nil;
+    self.title = @"";
+    self.bordered = YES;
+    self.bezelStyle = NSBezelStyleRounded;
+    self.buttonType = NSButtonTypePushOnPushOff;
+    self.refusesFirstResponder = YES;
+    _nameLabel = [NSTextField labelWithString:name];
+    _nameLabel.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
+    _nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    _nameLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _shortcutLabel = [NSTextField labelWithString:shortcut];
+    _shortcutLabel.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    _shortcutLabel.alignment = NSTextAlignmentRight;
+    _shortcutLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [_nameLabel setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                         forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [_shortcutLabel setContentCompressionResistancePriority:NSLayoutPriorityRequired
+                                             forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self addSubview:_nameLabel];
+    [self addSubview:_shortcutLabel];
+    [NSLayoutConstraint activateConstraints:@[
+        [_nameLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:9],
+        [_nameLabel.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [_nameLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_shortcutLabel.leadingAnchor constant:-5],
+        [_shortcutLabel.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-8],
+        [_shortcutLabel.centerYAnchor constraintEqualToAnchor:self.centerYAnchor]
+    ]];
+    [self setKeyboardSelected:NO];
+    return self;
+}
+
+- (NSView *)hitTest:(NSPoint)point {
+    return NSPointInRect(point, self.bounds) ? self : nil;
+}
+
+- (void)setKeyboardSelected:(BOOL)selected {
+    self.state = selected ? NSControlStateValueOn : NSControlStateValueOff;
+    _nameLabel.textColor = selected ? NSColor.alternateSelectedControlTextColor : NSColor.labelColor;
+    _shortcutLabel.textColor = selected ? NSColor.alternateSelectedControlTextColor : NSColor.secondaryLabelColor;
+}
+@end
+
+// ai coding: 让选择面板支持上下键高亮、回车确认及数字组合键直达 2026/09/17: 11:23
 @interface SDDrawerChoicePanel : NSPanel
-@property(nonatomic, copy) void (^numberSelectionHandler)(NSInteger index);
+@property(nonatomic, copy) void (^selectionHandler)(NSInteger index);
+@property(nonatomic, copy) NSArray<SDDrawerChoiceButton *> *choiceButtons;
+@property(nonatomic) NSInteger selectedIndex;
 @end
 
 @implementation SDDrawerChoicePanel
 - (BOOL)canBecomeKeyWindow { return YES; }
 - (BOOL)canBecomeMainWindow { return NO; }
 
-- (BOOL)handleNumberShortcut:(NSEvent *)event {
+- (void)setSelectedIndex:(NSInteger)selectedIndex {
+    if (self.choiceButtons.count == 0) {
+        _selectedIndex = NSNotFound;
+        return;
+    }
+    _selectedIndex = MAX(0, MIN(selectedIndex, (NSInteger)self.choiceButtons.count - 1));
+    [self.choiceButtons enumerateObjectsUsingBlock:^(SDDrawerChoiceButton *button, NSUInteger index, BOOL *stop __unused) {
+        [button setKeyboardSelected:index == (NSUInteger)self->_selectedIndex];
+    }];
+    SDDrawerChoiceButton *selectedButton = self.choiceButtons[(NSUInteger)_selectedIndex];
+    [selectedButton scrollRectToVisible:selectedButton.bounds];
+}
+
+- (BOOL)handleChoiceShortcut:(NSEvent *)event {
     if (event.type != NSEventTypeKeyDown) return NO;
     NSEventModifierFlags modifiers = event.modifierFlags &
         (NSEventModifierFlagCommand | NSEventModifierFlagOption |
          NSEventModifierFlagControl | NSEventModifierFlagShift);
-    if (modifiers != NSEventModifierFlagOption && modifiers != NSEventModifierFlagCommand) return NO;
     NSString *characters = event.charactersIgnoringModifiers;
-    if (characters.length != 1) return NO;
-    unichar character = [characters characterAtIndex:0];
-    if (character < '1' || character > '9') return NO;
-    if (self.numberSelectionHandler) self.numberSelectionHandler(character - '1');
-    return YES;
+    if (modifiers == NSEventModifierFlagOption || modifiers == NSEventModifierFlagCommand) {
+        if (characters.length != 1) return NO;
+        unichar character = [characters characterAtIndex:0];
+        if (character < '1' || character > '9') return NO;
+        NSInteger index = character - '1';
+        if (index >= (NSInteger)self.choiceButtons.count) {
+            NSBeep();
+            return YES;
+        }
+        self.selectedIndex = index;
+        if (self.selectionHandler) self.selectionHandler(index);
+        return YES;
+    }
+    if (modifiers != 0) return NO;
+    if (event.keyCode == 126) {
+        self.selectedIndex -= 1;
+        return YES;
+    }
+    if (event.keyCode == 125) {
+        self.selectedIndex += 1;
+        return YES;
+    }
+    if (event.keyCode == 36 || event.keyCode == 76 || [characters isEqualToString:@"\r"]) {
+        if (_selectedIndex != NSNotFound && self.selectionHandler) self.selectionHandler(_selectedIndex);
+        return YES;
+    }
+    return NO;
 }
 
 - (BOOL)performKeyEquivalent:(NSEvent *)event {
-    if ([self handleNumberShortcut:event]) return YES;
+    if ([self handleChoiceShortcut:event]) return YES;
     return [super performKeyEquivalent:event];
 }
 
 - (void)keyDown:(NSEvent *)event {
-    if ([self handleNumberShortcut:event]) return;
+    if ([self handleChoiceShortcut:event]) return;
     [super keyDown:event];
+}
+
+- (void)sendEvent:(NSEvent *)event {
+    if ([self handleChoiceShortcut:event]) return;
+    [super sendEvent:event];
 }
 @end
 
@@ -1678,15 +1772,16 @@ static NSString *SDShortcutDisplayString(CGEventFlags modifiers, NSString *keyNa
 // ai coding: 声明标准应用菜单和访达定位入口 2026/09/17: 09:06
 - (void)configureMainMenu;
 - (void)revealApplication:(id)sender;
-// ai coding: 声明批量解析名称及批量新建菜单操作 2026/09/17: 11:14
+// ai coding: 声明批量名称解析、四边分布及批量新建菜单操作 2026/09/17: 11:23
 - (NSArray<NSString *> *)drawerNamesFromBatchInput:(NSString *)input;
+- (NSArray<NSDictionary *> *)batchPlacementsForCount:(NSUInteger)count;
 - (void)batchCreateDrawers:(id)sender;
 // ai coding: 声明快捷键录制、展示和多抽屉目标选择入口 2026/09/17: 09:19
 - (void)loadMoveShortcut;
 - (void)showShortcutConfiguration:(id)sender;
 - (void)moveURLs:(NSArray<NSURL *> *)urls toDrawerID:(NSString *)drawerID;
 - (void)chooseDrawerAndMoveURLs:(NSArray<NSURL *> *)urls;
-// ai coding: 声明半宽多收纳盒选择面板及鼠标、数字快捷键和取消处理接口 2026/09/17: 11:11
+// ai coding: 声明支持方向键、回车及数字快捷键的多收纳盒选择接口 2026/09/17: 11:23
 - (SDDrawerChoicePanel *)drawerChoicePanelForDrawers:(NSArray<NSDictionary *> *)drawers
                                            itemCount:(NSInteger)itemCount;
 - (void)selectDrawerAtIndex:(NSInteger)index;
@@ -2086,7 +2181,28 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     return names;
 }
 
-// ai coding: 通过菜单输入多个名称，并按当前抽屉尺寸一次创建全部收纳盒 2026/09/17: 11:14
+// ai coding: 为批量创建计算上、下、左、右循环分布及同边均匀间距 2026/09/17: 11:23
+- (NSArray<NSDictionary *> *)batchPlacementsForCount:(NSUInteger)count {
+    NSArray<NSString *> *edges = @[SDEdgeTop, SDEdgeBottom, SDEdgeLeft, SDEdgeRight];
+    NSMutableDictionary<NSString *, NSNumber *> *counts = [NSMutableDictionary dictionary];
+    for (NSUInteger index = 0; index < count; index++) {
+        NSString *edge = edges[index % edges.count];
+        counts[edge] = @([counts[edge] unsignedIntegerValue] + 1);
+    }
+    NSMutableDictionary<NSString *, NSNumber *> *used = [NSMutableDictionary dictionary];
+    NSMutableArray<NSDictionary *> *placements = [NSMutableArray arrayWithCapacity:count];
+    for (NSUInteger index = 0; index < count; index++) {
+        NSString *edge = edges[index % edges.count];
+        NSUInteger edgeCount = [counts[edge] unsignedIntegerValue];
+        NSUInteger edgeIndex = [used[edge] unsignedIntegerValue];
+        CGFloat position = edgeCount <= 1 ? 0.5 : (CGFloat)edgeIndex / (CGFloat)(edgeCount - 1);
+        [placements addObject:@{@"edge": edge, @"position": @(position)}];
+        used[edge] = @(edgeIndex + 1);
+    }
+    return placements;
+}
+
+// ai coding: 批量创建后覆盖默认位置，使新收纳盒立即散布在屏幕四边 2026/09/17: 11:26
 - (void)batchCreateDrawers:(id)sender {
     [NSApp activateIgnoringOtherApps:YES];
     NSTextField *input = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 280, 26)];
@@ -2108,12 +2224,16 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     }
     NSString *sourceDrawerID = [self activeDrawerController].drawerID;
     NSMutableArray<NSString *> *createdDrawerIDs = [NSMutableArray arrayWithCapacity:names.count];
+    NSArray<NSDictionary *> *placements = [self batchPlacementsForCount:names.count];
     NSError *error = nil;
-    for (NSString *name in names) {
+    for (NSUInteger index = 0; index < names.count; index++) {
+        NSString *name = names[index];
         NSString *drawerID = [_store addDrawerWithName:name
                         copyingDimensionsFromDrawerID:sourceDrawerID
                                                  error:&error];
         if (!drawerID) break;
+        NSDictionary *placement = placements[index];
+        [_store updateDrawerID:drawerID edge:placement[@"edge"] position:[placement[@"position"] doubleValue]];
         [createdDrawerIDs addObject:drawerID];
     }
     if (createdDrawerIDs.count > 0) {
@@ -2183,7 +2303,7 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     }
 }
 
-// ai coding: 多个收纳盒时显示半宽面板并支持鼠标或组合键立即选择 2026/09/17: 11:11
+// ai coding: 多个收纳盒时默认高亮首项，并支持鼠标、方向键和组合键选择 2026/09/17: 11:23
 - (void)chooseDrawerAndMoveURLs:(NSArray<NSURL *> *)urls {
     [NSApp activateIgnoringOtherApps:YES];
     _selectedDrawerChoiceID = nil;
@@ -2200,7 +2320,7 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     if (drawerID.length > 0) [self moveURLs:urls toDrawerID:drawerID];
 }
 
-// ai coding: 将选择面板宽度减半、恢复原生控件颜色并纵向排列头部 2026/09/17: 11:11
+// ai coding: 将列表项改为左侧纯名称、右侧快捷键提示且不显示图标或数量 2026/09/17: 11:23
 - (SDDrawerChoicePanel *)drawerChoicePanelForDrawers:(NSArray<NSDictionary *> *)drawers
                                            itemCount:(NSInteger)itemCount {
     CGFloat panelWidth = 168;
@@ -2264,33 +2384,25 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
 
     SDFlippedView *document = [[SDFlippedView alloc] initWithFrame:NSMakeRect(0, 0, innerWidth, MAX(rowHeight, documentHeight))];
     NSMutableArray<NSString *> *drawerIDs = [NSMutableArray arrayWithCapacity:drawers.count];
+    NSMutableArray<SDDrawerChoiceButton *> *choiceButtons = [NSMutableArray arrayWithCapacity:drawers.count];
     [drawers enumerateObjectsUsingBlock:^(NSDictionary *drawer, NSUInteger index, BOOL *stop __unused) {
         NSString *drawerID = drawer[@"id"] ?: @"";
         [drawerIDs addObject:drawerID];
         NSString *drawerName = drawer[@"name"] ?: @"未命名收纳盒";
-        NSString *buttonTitle = index < 9
-            ? [NSString stringWithFormat:@"%lu  %@", (unsigned long)index + 1, drawerName]
-            : drawerName;
-        NSButton *button = [NSButton buttonWithTitle:buttonTitle
-                                              target:self
-                                              action:@selector(selectDrawerFromList:)];
+        NSString *shortcut = index < 9
+            ? [NSString stringWithFormat:@"⌘/⌥+%lu", (unsigned long)index + 1]
+            : @"";
+        SDDrawerChoiceButton *button = [[SDDrawerChoiceButton alloc] initWithName:drawerName shortcut:shortcut];
+        button.target = self;
+        button.action = @selector(selectDrawerFromList:);
         button.tag = (NSInteger)index;
-        button.alignment = NSTextAlignmentLeft;
-        button.bordered = YES;
-        button.bezelStyle = NSBezelStyleRounded;
-        button.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
-        button.image = [[NSImage imageWithSystemSymbolName:@"shippingbox" accessibilityDescription:@"收纳盒"]
-            imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:14
-                                                                                         weight:NSFontWeightRegular]];
-        button.imagePosition = NSImageLeading;
-        button.contentTintColor = NSColor.labelColor;
-        button.cell.lineBreakMode = NSLineBreakByTruncatingTail;
         button.toolTip = index < 9
             ? [NSString stringWithFormat:@"⌥%lu 或 ⌘%lu：%@", (unsigned long)index + 1,
                                                         (unsigned long)index + 1, drawerName]
             : drawerName;
         button.frame = NSMakeRect(0, index * (rowHeight + rowGap), innerWidth, rowHeight);
         [document addSubview:button];
+        [choiceButtons addObject:button];
     }];
     _drawerChoiceIDs = drawerIDs;
     NSScrollView *scroll = [[NSScrollView alloc]
@@ -2312,13 +2424,15 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     cancelButton.keyEquivalent = @"\e";
     [background addSubview:cancelButton];
     __weak typeof(self) weakSelf = self;
-    panel.numberSelectionHandler = ^(NSInteger index) {
+    panel.selectionHandler = ^(NSInteger index) {
         [weakSelf selectDrawerAtIndex:index];
     };
+    panel.choiceButtons = choiceButtons;
+    panel.selectedIndex = 0;
     return panel;
 }
 
-// ai coding: 统一处理鼠标和数字快捷键选择，并保留取消按钮与 Escape 关闭 2026/09/17: 11:11
+// ai coding: 统一处理鼠标、回车和数字快捷键选择，并保留 Escape 关闭 2026/09/17: 11:23
 - (void)selectDrawerAtIndex:(NSInteger)index {
     if (index < 0 || index >= (NSInteger)_drawerChoiceIDs.count) return;
     _selectedDrawerChoiceID = [_drawerChoiceIDs[(NSUInteger)index] copy];

@@ -1,4 +1,4 @@
-// ai coding: 验证隐藏数量、完整尺寸复制、批量新建及既有功能 2026/09/17: 11:17
+// ai coding: 验证方向键选择、快捷键提示、四边散开及既有功能 2026/09/17: 11:23
 #define main SideDrawerProductMain
 #import "../Sources/SideDrawer/main.m"
 #undef main
@@ -238,6 +238,16 @@ int main(void) {
             menuBatchNew != nil;
         NSArray<NSString *> *batchNames = [menuDelegate drawerNamesFromBatchInput:@" a， b,c ,, "];
         BOOL batchNamesReady = [batchNames isEqualToArray:@[@"a", @"b", @"c"]];
+        NSArray<NSDictionary *> *batchPlacements = [menuDelegate batchPlacementsForCount:6];
+        BOOL batchPlacementReady = batchPlacements.count == 6 &&
+            [batchPlacements[0][@"edge"] isEqualToString:SDEdgeTop] &&
+            [batchPlacements[1][@"edge"] isEqualToString:SDEdgeBottom] &&
+            [batchPlacements[2][@"edge"] isEqualToString:SDEdgeLeft] &&
+            [batchPlacements[3][@"edge"] isEqualToString:SDEdgeRight] &&
+            [batchPlacements[0][@"position"] doubleValue] == 0 &&
+            [batchPlacements[4][@"position"] doubleValue] == 1 &&
+            [batchPlacements[1][@"position"] doubleValue] == 0 &&
+            [batchPlacements[5][@"position"] doubleValue] == 1;
         [store updateDrawerID:drawerID edge:SDEdgeBottom position:0.4];
         [store updateDrawerID:drawerID length:712 forEdge:SDEdgeTop];
         [store updateDrawerID:drawerID length:528 forEdge:SDEdgeRight];
@@ -283,18 +293,51 @@ int main(void) {
         [menuDelegate setValue:nil forKey:@"selectedDrawerChoiceID"];
         BOOL commandNumberReady = [choicePanel performKeyEquivalent:commandThree] &&
             [[menuDelegate valueForKey:@"selectedDrawerChoiceID"] isEqualToString:@"drawer-c"];
+        unichar downCharacter = NSDownArrowFunctionKey;
+        NSString *downCharacters = [NSString stringWithCharacters:&downCharacter length:1];
+        NSEvent *downArrow = [NSEvent keyEventWithType:NSEventTypeKeyDown
+                                              location:NSZeroPoint
+                                         modifierFlags:0
+                                             timestamp:0
+                                          windowNumber:choicePanel.windowNumber
+                                               context:nil
+                                            characters:downCharacters
+                           charactersIgnoringModifiers:downCharacters
+                                             isARepeat:NO
+                                               keyCode:125];
+        NSEvent *returnKey = [NSEvent keyEventWithType:NSEventTypeKeyDown
+                                              location:NSZeroPoint
+                                         modifierFlags:0
+                                             timestamp:0
+                                          windowNumber:choicePanel.windowNumber
+                                               context:nil
+                                            characters:@"\r"
+                           charactersIgnoringModifiers:@"\r"
+                                             isARepeat:NO
+                                               keyCode:36];
+        choicePanel.selectedIndex = 0;
+        [menuDelegate setValue:nil forKey:@"selectedDrawerChoiceID"];
+        [choicePanel keyDown:downArrow];
+        BOOL arrowSelectionReady = choicePanel.selectedIndex == 1;
+        [choicePanel keyDown:returnKey];
+        BOOL returnSelectionReady =
+            [[menuDelegate valueForKey:@"selectedDrawerChoiceID"] isEqualToString:@"drawer-b"];
         BOOL directChoiceListReady = choicePanel.frame.size.width <= 168 &&
             SDCountViewsOfClass(choiceContent, NSButton.class) == 4 &&
+            SDCountViewsOfClass(choiceContent, SDDrawerChoiceButton.class) == 3 &&
             SDCountViewsOfClass(choiceContent, NSPopUpButton.class) == 0 &&
             SDCountViewsOfClass(choiceContent, NSImageView.class) == 1 &&
-            SDButtonWithTitle(choiceContent, @"1  项目 A") != nil &&
-            SDButtonWithTitle(choiceContent, @"2  项目 B") != nil &&
-            SDButtonWithTitle(choiceContent, @"3  项目 C") != nil &&
+            SDTextFieldContaining(choiceContent, @"项目 A") != nil &&
+            SDTextFieldContaining(choiceContent, @"项目 B") != nil &&
+            SDTextFieldContaining(choiceContent, @"项目 C") != nil &&
+            SDTextFieldContaining(choiceContent, @"⌘/⌥+1") != nil &&
+            SDTextFieldContaining(choiceContent, @"⌘/⌥+2") != nil &&
+            SDTextFieldContaining(choiceContent, @"⌘/⌥+3") != nil &&
             SDButtonWithTitle(choiceContent, @"取消") != nil &&
             SDButtonWithTitle(choiceContent, @"确定") == nil &&
             SDTextFieldContaining(choiceContent, @"选择收纳箱") != nil &&
             SDTextFieldContaining(choiceContent, @"2 个项目") != nil &&
-            optionNumberReady && commandNumberReady;
+            optionNumberReady && commandNumberReady && arrowSelectionReady && returnSelectionReady;
         [store updateDrawerID:drawerID length:500 forEdge:SDEdgeRight];
         SDDrawerPanelController *verticalController = [[SDDrawerPanelController alloc] initWithStore:store drawerID:drawerID];
         BOOL verticalSizeReady = verticalController.panel.frame.size.width == 95 &&
@@ -367,14 +410,14 @@ int main(void) {
             carbonModifiersReady && dropAnimationReady && verticalSizeReady && horizontalSizeReady &&
             verticalResizeDirectionReady && normalNameFocusReady && newDrawerNameFocusReady &&
             verticalEdgeSnapReady && horizontalEdgeSnapReady && keyboardRenameReady && menuShortcutsReady &&
-            directChoiceListReady && batchNamesReady && copiedDimensionsReady) {
+            directChoiceListReady && batchNamesReady && batchPlacementReady && copiedDimensionsReady) {
             fprintf(stdout, "SIDEDRAWER_SELECTION_TEST_OK\n");
             return 0;
         }
         fprintf(stderr,
-                "SIDEDRAWER_SELECTION_TEST_FAILED all=%d visible=%d pile=%d batch=%d shortcut=%d menu=%d directChoice=%d batchNames=%d copiedSize=%d stale=%d countHidden=%d borderless=%d plus=%d controls=%d pin=%d centered=%d horizontalControls=%d recorder=%d matcher=%d carbon=%d normalFocus=%d renameFocus=%d keyboardRename=%d verticalSnap=%d horizontalSnap=%d items=(%.1f,%.1f,%.1f,%.1f) drop=%d vertical=%d horizontal=%d resizeDirection=%d resizeHandle=(%.1f,%.1f,%.1f,%.1f)\n",
+                "SIDEDRAWER_SELECTION_TEST_FAILED all=%d visible=%d pile=%d batch=%d shortcut=%d menu=%d directChoice=%d batchNames=%d batchPlacement=%d copiedSize=%d stale=%d countHidden=%d borderless=%d plus=%d controls=%d pin=%d centered=%d horizontalControls=%d recorder=%d matcher=%d carbon=%d normalFocus=%d renameFocus=%d keyboardRename=%d verticalSnap=%d horizontalSnap=%d items=(%.1f,%.1f,%.1f,%.1f) drop=%d vertical=%d horizontal=%d resizeDirection=%d resizeHandle=(%.1f,%.1f,%.1f,%.1f)\n",
                 allItemsSelected, visibleSelected, pileSelected, batchDragReady, shortcutHandled, menuShortcutsReady,
-                directChoiceListReady, batchNamesReady, copiedDimensionsReady,
+                directChoiceListReady, batchNamesReady, batchPlacementReady, copiedDimensionsReady,
                 staleSelectionRemoved, countHidden, titleBorderless, plusRemoved, controlsPlaced, pinRotated,
                 itemsCentered, horizontalControlsReady, shortcutRecorderReady, shortcutMatchingReady,
                 carbonModifiersReady, normalNameFocusReady, newDrawerNameFocusReady, keyboardRenameReady,
