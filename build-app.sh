@@ -1,5 +1,5 @@
 #!/bin/zsh
-# ai coding: 构建包含 Quick Look 悬停预览的 SideDrawer 2026/09/17: 13:50
+# ai coding: 构建支持预览内滚动的 Quick Look SideDrawer 2026/09/17: 13:58
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"

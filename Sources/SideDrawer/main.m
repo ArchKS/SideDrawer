@@ -475,6 +475,37 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
 }
 @end
 
+// ai coding: 让 Quick Look 预览窗口接收鼠标进入和离开事件，支持在预览内滚动长文本 2026/09/17: 13:58
+@interface SDHoverPreviewView : NSVisualEffectView
+@property(nonatomic, copy) void (^enteredHandler)(void);
+@property(nonatomic, copy) void (^exitedHandler)(void);
+@end
+
+@implementation SDHoverPreviewView
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    NSTrackingArea *trackingArea = [[NSTrackingArea alloc]
+        initWithRect:NSZeroRect
+              options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                      NSTrackingInVisibleRect
+                owner:self
+             userInfo:nil];
+    [self addTrackingArea:trackingArea];
+    return self;
+}
+
+- (void)mouseEntered:(NSEvent *)event {
+    [super mouseEntered:event];
+    if (self.enteredHandler) self.enteredHandler();
+}
+
+- (void)mouseExited:(NSEvent *)event {
+    [super mouseExited:event];
+    if (self.exitedHandler) self.exitedHandler();
+}
+@end
+
 // ai coding: 压缩横向文件项并增加文件悬停预览能力 2026/09/17: 13:50
 @interface SDFileTileView : NSView <NSDraggingSource>
 @property(nonatomic, getter=isSelected) BOOL selected;
@@ -498,8 +529,16 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     BOOL _isDirectory;
     NSPanel *_previewPanel;
     QLPreviewView *_previewView;
+    BOOL _tileHovered;
+    BOOL _previewHovered;
     BOOL _draggedAfterMouseDown;
     BOOL _collapseSelectionOnMouseUp;
+}
+
+// ai coding: 文件卡片销毁时关闭 Quick Look，避免悬停预览窗口残留 2026/09/17: 14:01
+- (void)dealloc {
+    [_previewPanel orderOut:nil];
+    [_previewView close];
 }
 
 - (instancetype)initWithURL:(NSURL *)url iconOnTop:(BOOL)iconOnTop completion:(void (^)(void))completion
@@ -573,10 +612,10 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
         _previewPanel.floatingPanel = YES;
         _previewPanel.hidesOnDeactivate = NO;
         _previewPanel.becomesKeyOnlyIfNeeded = YES;
-        _previewPanel.ignoresMouseEvents = YES;
+        _previewPanel.ignoresMouseEvents = NO;
         _previewPanel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
                                             NSWindowCollectionBehaviorFullScreenAuxiliary;
-        NSVisualEffectView *background = [[NSVisualEffectView alloc]
+        SDHoverPreviewView *background = [[SDHoverPreviewView alloc]
             initWithFrame:NSMakeRect(0, 0, 320, 240)];
         background.material = NSVisualEffectMaterialPopover;
         background.blendingMode = NSVisualEffectBlendingModeBehindWindow;
@@ -590,6 +629,9 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
         _previewView.autostarts = NO;
         [background addSubview:_previewView];
         _previewPanel.contentView = background;
+        __weak typeof(self) weakSelf = self;
+        background.enteredHandler = ^{ [weakSelf previewDidEnter]; };
+        background.exitedHandler = ^{ [weakSelf previewDidExit]; };
     }
     _previewView.previewItem = _url;
     NSRect tileInWindow = [self convertRect:self.bounds toView:nil];
@@ -613,22 +655,44 @@ static NSImage *SDRotatedPinSymbol(BOOL locked) {
     [_previewPanel orderFrontRegardless];
 }
 
-// ai coding: 鼠标离开文件卡片或开始拖拽时立即关闭悬停预览 2026/09/17: 13:50
+// ai coding: 在文件卡片和预览窗口之间保持悬停状态，允许滚动长文本内容 2026/09/17: 13:58
+- (void)previewDidEnter {
+    _previewHovered = YES;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(hideHoverPreviewIfPointerLeft) object:nil];
+}
+
+- (void)previewDidExit {
+    _previewHovered = NO;
+    [self performSelector:@selector(hideHoverPreviewIfPointerLeft) withObject:nil afterDelay:0.18];
+}
+
+- (void)hideHoverPreviewIfPointerLeft {
+    if (_tileHovered || _previewHovered) return;
+    [_previewPanel orderOut:nil];
+}
+
+// ai coding: 鼠标离开文件卡片或开始拖拽时关闭悬停预览 2026/09/17: 13:58
 - (void)hideHoverPreview {
     [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(showHoverPreview) object:nil];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(hideHoverPreviewIfPointerLeft) object:nil];
+    _tileHovered = NO;
+    _previewHovered = NO;
     [_previewPanel orderOut:nil];
 }
 
 - (void)mouseEntered:(NSEvent *)event {
     [super mouseEntered:event];
     if (_isDirectory) return;
+    _tileHovered = YES;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(hideHoverPreviewIfPointerLeft) object:nil];
     [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(showHoverPreview) object:nil];
     [self performSelector:@selector(showHoverPreview) withObject:nil afterDelay:0.22];
 }
 
 - (void)mouseExited:(NSEvent *)event {
     [super mouseExited:event];
-    [self hideHoverPreview];
+    _tileHovered = NO;
+    [self performSelector:@selector(hideHoverPreviewIfPointerLeft) withObject:nil afterDelay:0.18];
 }
 
 - (void)layout {
