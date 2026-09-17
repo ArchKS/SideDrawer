@@ -1,4 +1,4 @@
-// ai coding: 验证菜单快捷键、关闭按钮、键盘改名及既有功能 2026/09/17: 10:47
+// ai coding: 验证多收纳盒直接选择列表、菜单快捷键及既有功能 2026/09/17: 10:55
 #define main SideDrawerProductMain
 #import "../Sources/SideDrawer/main.m"
 #undef main
@@ -26,6 +26,12 @@ static NSMenuItem *SDMenuItemWithTitle(NSMenu *menu, NSString *title) {
         if ([item.title isEqualToString:title]) return item;
     }
     return nil;
+}
+
+static NSInteger SDCountViewsOfClass(NSView *view, Class viewClass) {
+    NSInteger count = [view isKindOfClass:viewClass] ? 1 : 0;
+    for (NSView *subview in view.subviews) count += SDCountViewsOfClass(subview, viewClass);
+    return count;
 }
 
 int main(void) {
@@ -211,6 +217,14 @@ int main(void) {
             (menuSave.keyEquivalentModifierMask & NSEventModifierFlagCommand) != 0 &&
             (menuSelectAll.keyEquivalentModifierMask & NSEventModifierFlagCommand) != 0 &&
             menuDelete.keyEquivalent.length == 1 && menuDelete.keyEquivalentModifierMask == 0;
+        NSArray<NSDictionary *> *choiceDrawers = @[
+            @{@"id": @"drawer-a", @"name": @"项目 A"},
+            @{@"id": @"drawer-b", @"name": @"项目 B"},
+            @{@"id": @"drawer-c", @"name": @"项目 C"}
+        ];
+        NSScrollView *choiceList = [menuDelegate drawerChoiceListForDrawers:choiceDrawers];
+        BOOL directChoiceListReady = SDCountViewsOfClass(choiceList, NSButton.class) == 3 &&
+            SDCountViewsOfClass(choiceList, NSPopUpButton.class) == 0;
         [store updateDrawerID:drawerID length:500 forEdge:SDEdgeRight];
         SDDrawerPanelController *verticalController = [[SDDrawerPanelController alloc] initWithStore:store drawerID:drawerID];
         BOOL verticalSizeReady = verticalController.panel.frame.size.width == 95 &&
@@ -282,13 +296,15 @@ int main(void) {
             itemsCentered && horizontalControlsReady && shortcutRecorderReady && shortcutMatchingReady &&
             carbonModifiersReady && dropAnimationReady && verticalSizeReady && horizontalSizeReady &&
             verticalResizeDirectionReady && normalNameFocusReady && newDrawerNameFocusReady &&
-            verticalEdgeSnapReady && horizontalEdgeSnapReady && keyboardRenameReady && menuShortcutsReady) {
+            verticalEdgeSnapReady && horizontalEdgeSnapReady && keyboardRenameReady && menuShortcutsReady &&
+            directChoiceListReady) {
             fprintf(stdout, "SIDEDRAWER_SELECTION_TEST_OK\n");
             return 0;
         }
         fprintf(stderr,
-                "SIDEDRAWER_SELECTION_TEST_FAILED all=%d visible=%d pile=%d batch=%d shortcut=%d menu=%d stale=%d title=%d borderless=%d plus=%d controls=%d pin=%d centered=%d horizontalControls=%d recorder=%d matcher=%d carbon=%d normalFocus=%d renameFocus=%d keyboardRename=%d verticalSnap=%d horizontalSnap=%d items=(%.1f,%.1f,%.1f,%.1f) drop=%d vertical=%d horizontal=%d resizeDirection=%d resizeHandle=(%.1f,%.1f,%.1f,%.1f)\n",
+                "SIDEDRAWER_SELECTION_TEST_FAILED all=%d visible=%d pile=%d batch=%d shortcut=%d menu=%d directChoice=%d stale=%d title=%d borderless=%d plus=%d controls=%d pin=%d centered=%d horizontalControls=%d recorder=%d matcher=%d carbon=%d normalFocus=%d renameFocus=%d keyboardRename=%d verticalSnap=%d horizontalSnap=%d items=(%.1f,%.1f,%.1f,%.1f) drop=%d vertical=%d horizontal=%d resizeDirection=%d resizeHandle=(%.1f,%.1f,%.1f,%.1f)\n",
                 allItemsSelected, visibleSelected, pileSelected, batchDragReady, shortcutHandled, menuShortcutsReady,
+                directChoiceListReady,
                 staleSelectionRemoved, titleOnOneLine, titleBorderless, plusRemoved, controlsPlaced, pinRotated,
                 itemsCentered, horizontalControlsReady, shortcutRecorderReady, shortcutMatchingReady,
                 carbonModifiersReady, normalNameFocusReady, newDrawerNameFocusReady, keyboardRenameReady,

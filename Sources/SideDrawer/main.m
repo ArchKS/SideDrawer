@@ -1636,6 +1636,9 @@ static NSString *SDShortcutDisplayString(CGEventFlags modifiers, NSString *keyNa
 - (void)showShortcutConfiguration:(id)sender;
 - (void)moveURLs:(NSArray<NSURL *> *)urls toDrawerID:(NSString *)drawerID;
 - (void)chooseDrawerAndMoveURLs:(NSArray<NSURL *> *)urls;
+// ai coding: 声明多收纳盒直接选择列表的构建与点击处理接口 2026/09/17: 10:55
+- (NSScrollView *)drawerChoiceListForDrawers:(NSArray<NSDictionary *> *)drawers;
+- (void)selectDrawerFromList:(NSButton *)sender;
 @end
 
 // ai coding: 将用户录制的修饰键转换为 Carbon 全局热键格式 2026/09/17: 09:44
@@ -1678,6 +1681,8 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     NSString *_moveShortcutKeyName;
     // ai coding: 保存最后激活的收纳盒标识以路由菜单操作 2026/09/17: 10:47
     NSString *_activeDrawerID;
+    NSArray<NSString *> *_drawerChoiceIDs;
+    NSString *_selectedDrawerChoiceID;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
@@ -2062,23 +2067,55 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     }
 }
 
-// ai coding: 多个收纳箱时弹出目标选择面板，单个目标沿用直接移动流程 2026/09/17: 09:19
+// ai coding: 多个收纳盒时直接列出全部目标，点击选项即完成选择 2026/09/17: 10:55
 - (void)chooseDrawerAndMoveURLs:(NSArray<NSURL *> *)urls {
     [NSApp activateIgnoringOtherApps:YES];
-    NSPopUpButton *drawerPicker = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, 280, 28) pullsDown:NO];
-    for (NSDictionary *drawer in _store.drawers) {
-        [drawerPicker addItemWithTitle:drawer[@"name"] ?: @"未命名收纳箱"];
-        drawerPicker.lastItem.representedObject = drawer[@"id"];
-    }
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"选择收纳箱";
-    alert.informativeText = [NSString stringWithFormat:@"将 Finder 中选中的 %ld 个项目移动到：", (long)urls.count];
-    alert.accessoryView = drawerPicker;
-    [alert addButtonWithTitle:@"移动"];
+    alert.informativeText = [NSString stringWithFormat:@"点击目标，将 Finder 中选中的 %ld 个项目立即移动过去：", (long)urls.count];
+    _selectedDrawerChoiceID = nil;
+    alert.accessoryView = [self drawerChoiceListForDrawers:_store.drawers];
     [alert addButtonWithTitle:@"取消"];
-    if ([alert runModal] != NSAlertFirstButtonReturn) return;
-    NSString *drawerID = drawerPicker.selectedItem.representedObject;
+    NSModalResponse response = [alert runModal];
+    NSString *drawerID = [_selectedDrawerChoiceID copy];
+    _drawerChoiceIDs = nil;
+    _selectedDrawerChoiceID = nil;
+    if (response != NSModalResponseOK) return;
     if (drawerID.length > 0) [self moveURLs:urls toDrawerID:drawerID];
+}
+
+- (NSScrollView *)drawerChoiceListForDrawers:(NSArray<NSDictionary *> *)drawers {
+    CGFloat rowHeight = 36;
+    CGFloat documentHeight = MAX(rowHeight, drawers.count * rowHeight);
+    CGFloat visibleHeight = MIN(documentHeight, 324);
+    SDFlippedView *document = [[SDFlippedView alloc] initWithFrame:NSMakeRect(0, 0, 300, documentHeight)];
+    NSMutableArray<NSString *> *drawerIDs = [NSMutableArray arrayWithCapacity:drawers.count];
+    [drawers enumerateObjectsUsingBlock:^(NSDictionary *drawer, NSUInteger index, BOOL *stop __unused) {
+        NSString *drawerID = drawer[@"id"] ?: @"";
+        [drawerIDs addObject:drawerID];
+        NSButton *button = [NSButton buttonWithTitle:drawer[@"name"] ?: @"未命名收纳盒"
+                                              target:self
+                                              action:@selector(selectDrawerFromList:)];
+        button.tag = (NSInteger)index;
+        button.alignment = NSTextAlignmentLeft;
+        button.bezelStyle = NSBezelStyleRounded;
+        button.image = [NSImage imageWithSystemSymbolName:@"shippingbox" accessibilityDescription:@"收纳盒"];
+        button.imagePosition = NSImageLeading;
+        button.frame = NSMakeRect(0, index * rowHeight, 300, 32);
+        [document addSubview:button];
+    }];
+    _drawerChoiceIDs = drawerIDs;
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 300, visibleHeight)];
+    scroll.drawsBackground = NO;
+    scroll.hasVerticalScroller = documentHeight > visibleHeight;
+    scroll.documentView = document;
+    return scroll;
+}
+
+- (void)selectDrawerFromList:(NSButton *)sender {
+    if (sender.tag < 0 || sender.tag >= (NSInteger)_drawerChoiceIDs.count) return;
+    _selectedDrawerChoiceID = [_drawerChoiceIDs[(NSUInteger)sender.tag] copy];
+    [NSApp stopModalWithCode:NSModalResponseOK];
 }
 
 - (void)moveURLs:(NSArray<NSURL *> *)urls toDrawerID:(NSString *)drawerID {
