@@ -35,8 +35,17 @@
     return self;
 }
 
+// ai coding: 按父视图坐标命中整个抽屉选项并允许窗口切换后的首次点击 2026/09/20: 10:05
 - (NSView *)hitTest:(NSPoint)point {
-    return NSPointInRect(point, self.bounds) ? self : nil;
+    return NSPointInRect(point, self.frame) ? self : nil;
+}
+
+- (BOOL)mouseDownCanMoveWindow {
+    return NO;
+}
+
+- (BOOL)acceptsFirstMouse:(NSEvent *)event __unused {
+    return YES;
 }
 
 - (void)setKeyboardSelected:(BOOL)selected {
