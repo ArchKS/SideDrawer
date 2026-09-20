@@ -31,6 +31,26 @@ macOS 原生侧边文件抽屉。文件或目录拖入后会被移动到 SideDra
 - 将整个抽屉保存为同名文件夹
 - 菜单栏图标用于新建、显示全部、隐藏全部和退出
 
+<!-- ai coding: 补充 Finder 即时刷新、写盘失败提示与代码结构说明 2026/09/17: 15:50 -->
+- 快捷键移动成功后立即刷新访达前窗口，原位置的文件即时消失
+- 抽屉接收拖入或粘贴的文件后同样刷新访达，避免外部视图残留已移动的项目
+- 抽屉设置写盘失败时弹出提示并给出原因，不再静默丢失名称、位置或尺寸改动
+<!-- ai coding: 补充全文统一为“抽屉”和“访达”的用词说明 2026/09/17: 16:11 -->
+- 界面、菜单与提示文案统一使用“抽屉”和“访达”两个名词，不再混用收纳盒、收纳箱或 Finder
+
+## 代码结构
+
+| 文件 | 职责 |
+| --- | --- |
+| `Sources/SideDrawer/SDCommon.{h,m}` | 共享常量、菜单文案、错误与访达刷新工具 |
+| `Sources/SideDrawer/SDDrawerStore.{h,m}` | 抽屉元数据与文件存储层 |
+| `Sources/SideDrawer/SDDrawerContentView.{h,m}` | 抽屉内容视图、文件卡片与堆叠项 |
+| `Sources/SideDrawer/SDDrawerPanel.{h,m}` | 抽屉窗口、吸附与尺寸控制 |
+| `Sources/SideDrawer/SDShortcutRecorder.{h,m}` | 全局快捷键录制与展示 |
+| `Sources/SideDrawer/SDDrawerChoicePanel.{h,m}` | 多收纳盒目标选择面板 |
+| `Sources/SideDrawer/SDAppDelegate.{h,m}` | 应用生命周期、菜单与快捷键流程 |
+| `Sources/SideDrawer/main.m` | 进程入口与自检 |
+
 ## 构建
 
 ```sh

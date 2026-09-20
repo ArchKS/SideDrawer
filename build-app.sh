@@ -19,7 +19,7 @@ clang -fobjc-arc -fblocks -fmodules \
     -framework Carbon \
     -framework QuartzCore \
     -framework QuickLookUI \
-    "Sources/SideDrawer/main.m" \
+    Sources/SideDrawer/*.m \
     -o "$CONTENTS_PATH/MacOS/SideDrawer"
 cp "Resources/Info.plist" "$CONTENTS_PATH/Info.plist"
 cp "Resources/SideDrawer.icns" "$CONTENTS_PATH/Resources/SideDrawer.icns"

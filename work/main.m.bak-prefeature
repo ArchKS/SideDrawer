@@ -1,0 +1,3155 @@
+// ai coding: 增加可发现的快捷键权限入口并仅在授权后监听 Finder 的 Command+M 2026/09/16: 20:36
+#import <Cocoa/Cocoa.h>
+#import <ApplicationServices/ApplicationServices.h>
+// ai coding: 引入原生 Quick Look 以支持文件悬停预览 2026/09/17: 13:50
+#import <QuickLookUI/QuickLookUI.h>
+// ai coding: 引入 Carbon 原生热键接口以避免辅助功能键盘监听失效 2026/09/17: 09:44
+#import <Carbon/Carbon.h>
+// ai coding: 引入 QuartzCore 以实现拖入落点的脉冲动画 2026/09/17: 08:41
+#import <QuartzCore/QuartzCore.h>
+
+static NSString * const SDErrorDomain = @"com.codex.sidedrawer";
+static NSString * const SDEdgeLeft = @"left";
+static NSString * const SDEdgeRight = @"right";
+static NSString * const SDEdgeTop = @"top";
+static NSString * const SDEdgeBottom = @"bottom";
+
+// ai coding: 将抽屉长度下限缩为单个文件卡片沿抽屉方向的尺寸 2026/09/17: 13:41
+static const CGFloat SDHorizontalMinimumLength = 72.0;
+static const CGFloat SDVerticalMinimumLength = 46.0;
+// ai coding: 为菜单手动输入的抽屉厚度设置安全下限，避免内容区无法操作 2026/09/17: 14:10
+static const CGFloat SDHorizontalMinimumThickness = 32.0;
+static const CGFloat SDVerticalMinimumThickness = 32.0;
+
+static NSError *SDError(NSInteger code, NSString *message) {
+    return [NSError errorWithDomain:SDErrorDomain code:code userInfo:@{NSLocalizedDescriptionKey: message}];
+}
+
+static BOOL SDEdgeIsHorizontal(NSString *edge) {
+    return [edge isEqualToString:SDEdgeTop] || [edge isEqualToString:SDEdgeBottom];
+}
+
+// ai coding: 转义 Finder AppleScript 路径字符串，避免特殊字符破坏选择脚本 2026/09/17: 11:51
+static NSString *SDEscapeAppleScriptString(NSString *value) {
+    NSString *escaped = [value stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
+    return [escaped stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+}
+
+// ai coding: 生成不会被自动布局重置的 -45° 旋转系统图标 2026/09/17: 09:19
+static NSImage *SDRotatedPinSymbol(BOOL locked) {
+    NSString *description = locked ? @"旋转-45度的取消固定" : @"旋转-45度的固定抽屉";
+    NSImage *source = [NSImage imageWithSystemSymbolName:locked ? @"pin.fill" : @"pin"
+                               accessibilityDescription:description];
+    NSImage *rotated = [[NSImage alloc] initWithSize:NSMakeSize(16, 16)];
+    [rotated lockFocus];
+    NSAffineTransform *transform = [NSAffineTransform transform];
+    [transform translateXBy:8 yBy:8];
+    [transform rotateByDegrees:-45];
+    [transform concat];
+    [source drawInRect:NSMakeRect(-6, -6, 12, 12)
+              fromRect:NSZeroRect
+             operation:NSCompositingOperationSourceOver
+              fraction:1
+        respectFlipped:NO
+                 hints:nil];
+    [rotated unlockFocus];
+    rotated.template = YES;
+    rotated.accessibilityDescription = description;
+    return rotated;
+}
+
+@interface SDDrawerStore : NSObject
+@property(nonatomic, readonly) NSArray<NSDictionary *> *drawers;
+- (instancetype)initWithError:(NSError **)error;
+- (NSDictionary *)drawerForID:(NSString *)drawerID;
+- (NSArray<NSURL *> *)itemsForDrawerID:(NSString *)drawerID;
+- (NSString *)addDrawer:(NSError **)error;
+// ai coding: 声明可指定名称并复制现有抽屉尺寸的新建接口 2026/09/17: 11:14
+- (NSString *)addDrawerWithName:(NSString *)requestedName
+ copyingDimensionsFromDrawerID:(NSString *)sourceDrawerID
+                          error:(NSError **)error;
+- (BOOL)renameDrawerID:(NSString *)drawerID name:(NSString *)name error:(NSError **)error;
+- (BOOL)deleteDrawerID:(NSString *)drawerID error:(NSError **)error;
+// ai coding: 声明检测并批量删除空收纳盒的安全操作 2026/09/17: 11:30
+- (BOOL)hasDeletableEmptyDrawers;
+- (NSUInteger)deleteEmptyDrawers:(NSError **)error;
+- (BOOL)importURLs:(NSArray<NSURL *> *)urls drawerID:(NSString *)drawerID error:(NSError **)error;
+- (BOOL)moveItem:(NSURL *)itemURL toDirectory:(NSURL *)directory error:(NSError **)error;
+- (NSURL *)saveDrawerID:(NSString *)drawerID inDirectory:(NSURL *)directory error:(NSError **)error;
+- (void)updateDrawerID:(NSString *)drawerID edge:(NSString *)edge position:(CGFloat)position;
+- (void)updateDrawerID:(NSString *)drawerID locked:(BOOL)locked;
+// ai coding: 声明按吸附方向保存用户自定义抽屉长度的接口 2026/09/17: 09:01
+- (void)updateDrawerID:(NSString *)drawerID length:(CGFloat)length forEdge:(NSString *)edge;
+// ai coding: 声明按吸附方向保存菜单输入的抽屉高度或宽度 2026/09/17: 14:10
+- (void)updateDrawerID:(NSString *)drawerID thickness:(CGFloat)thickness forEdge:(NSString *)edge;
+@end
+
+@implementation SDDrawerStore {
+    NSMutableArray<NSMutableDictionary *> *_mutableDrawers;
+    NSURL *_rootURL;
+    NSURL *_drawersURL;
+    NSURL *_metadataURL;
+}
+
+- (instancetype)initWithError:(NSError **)error {
+    self = [super init];
+    if (!self) return nil;
+    NSFileManager *manager = NSFileManager.defaultManager;
+    NSString *storageOverride = NSProcessInfo.processInfo.environment[@"SIDEDRAWER_STORAGE_ROOT"];
+    if (storageOverride.length > 0) {
+        _rootURL = [NSURL fileURLWithPath:storageOverride isDirectory:YES];
+    } else {
+        NSURL *supportURL = [manager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
+        if (!supportURL) supportURL = manager.temporaryDirectory;
+        _rootURL = [supportURL URLByAppendingPathComponent:@"SideDrawer" isDirectory:YES];
+    }
+    _drawersURL = [_rootURL URLByAppendingPathComponent:@"Drawers" isDirectory:YES];
+    _metadataURL = [_rootURL URLByAppendingPathComponent:@"drawers.json"];
+    if (![manager createDirectoryAtURL:_drawersURL withIntermediateDirectories:YES attributes:nil error:error]) return nil;
+    [self loadMetadata];
+    if (_mutableDrawers.count == 0 && ![self createDefaultDrawer:error]) return nil;
+    return self;
+}
+
+- (NSArray<NSDictionary *> *)drawers { return [_mutableDrawers copy]; }
+
+- (NSDictionary *)drawerForID:(NSString *)drawerID {
+    for (NSDictionary *drawer in _mutableDrawers) {
+        if ([drawer[@"id"] isEqualToString:drawerID]) return drawer;
+    }
+    return nil;
+}
+
+- (NSMutableDictionary *)mutableDrawerForID:(NSString *)drawerID {
+    for (NSMutableDictionary *drawer in _mutableDrawers) {
+        if ([drawer[@"id"] isEqualToString:drawerID]) return drawer;
+    }
+    return nil;
+}
+
+- (NSArray<NSURL *> *)itemsForDrawerID:(NSString *)drawerID {
+    NSDictionary *drawer = [self drawerForID:drawerID];
+    if (!drawer) return @[];
+    NSArray<NSURL *> *urls = [NSFileManager.defaultManager contentsOfDirectoryAtURL:[self directoryForDrawer:drawer]
+                                                          includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+                                                                             options:NSDirectoryEnumerationSkipsHiddenFiles
+                                                                               error:nil] ?: @[];
+    return [urls sortedArrayUsingComparator:^NSComparisonResult(NSURL *left, NSURL *right) {
+        NSNumber *leftDirectory = nil;
+        NSNumber *rightDirectory = nil;
+        [left getResourceValue:&leftDirectory forKey:NSURLIsDirectoryKey error:nil];
+        [right getResourceValue:&rightDirectory forKey:NSURLIsDirectoryKey error:nil];
+        if (leftDirectory.boolValue != rightDirectory.boolValue) {
+            return leftDirectory.boolValue ? NSOrderedAscending : NSOrderedDescending;
+        }
+        return [left.lastPathComponent localizedStandardCompare:right.lastPathComponent];
+    }];
+}
+
+- (NSString *)addDrawer:(NSError **)error {
+    return [self addDrawerWithName:nil copyingDimensionsFromDrawerID:nil error:error];
+}
+
+// ai coding: 新建抽屉时支持自定义名称，并沿用指定抽屉的方向和完整尺寸 2026/09/17: 11:17
+- (NSString *)addDrawerWithName:(NSString *)requestedName
+ copyingDimensionsFromDrawerID:(NSString *)sourceDrawerID
+                          error:(NSError **)error {
+    NSMutableSet<NSString *> *names = [NSMutableSet set];
+    for (NSDictionary *drawer in _mutableDrawers) [names addObject:drawer[@"name"]];
+    NSString *name = [self sanitizedName:requestedName ?: @""];
+    if (name.length == 0 && requestedName.length > 0) {
+        if (error) *error = SDError(9, @"收纳盒名称不能为空。");
+        return nil;
+    }
+    if (name.length == 0) {
+        NSInteger number = _mutableDrawers.count + 1;
+        name = [NSString stringWithFormat:@"新抽屉 %ld", (long)number];
+        while ([names containsObject:name]) {
+            number += 1;
+            name = [NSString stringWithFormat:@"新抽屉 %ld", (long)number];
+        }
+    }
+    NSInteger slot = _mutableDrawers.count % 5;
+    NSDictionary *sourceDrawer = sourceDrawerID.length > 0 ? [self drawerForID:sourceDrawerID] : nil;
+    NSString *defaultEdge = ((_mutableDrawers.count / 5) % 2 == 0) ? SDEdgeRight : SDEdgeLeft;
+    NSString *edge = sourceDrawer[@"edge"] ?: defaultEdge;
+    NSNumber *horizontalLength = sourceDrawer[@"horizontalLength"] ?: @580;
+    NSNumber *verticalLength = sourceDrawer[@"verticalLength"] ?: @430;
+    // ai coding: 新建抽屉时继承当前抽屉的上下高度和左右宽度 2026/09/17: 14:10
+    NSNumber *horizontalThickness = sourceDrawer[@"horizontalThickness"] ?: @66;
+    NSNumber *verticalThickness = sourceDrawer[@"verticalThickness"] ?: @95;
+    NSMutableDictionary *drawer = [@{
+        @"id": NSUUID.UUID.UUIDString,
+        @"name": name,
+        @"edge": edge,
+        @"position": @(0.05 + slot * 0.2),
+        @"locked": @NO,
+        @"horizontalLength": horizontalLength,
+        @"verticalLength": verticalLength,
+        @"horizontalThickness": horizontalThickness,
+        @"verticalThickness": verticalThickness
+    } mutableCopy];
+    [_mutableDrawers addObject:drawer];
+    if (![NSFileManager.defaultManager createDirectoryAtURL:[self directoryForDrawer:drawer]
+                                withIntermediateDirectories:YES attributes:nil error:error]) {
+        [_mutableDrawers removeLastObject];
+        return nil;
+    }
+    if (![self writeMetadata:error]) return nil;
+    return drawer[@"id"];
+}
+
+- (BOOL)renameDrawerID:(NSString *)drawerID name:(NSString *)rawName error:(NSError **)error {
+    NSString *name = [self sanitizedName:rawName];
+    if (name.length == 0) {
+        if (error) *error = SDError(1, @"抽屉名称不能为空。");
+        return NO;
+    }
+    NSMutableDictionary *drawer = [self mutableDrawerForID:drawerID];
+    if (!drawer) {
+        if (error) *error = SDError(2, @"找不到这个抽屉。");
+        return NO;
+    }
+    drawer[@"name"] = name;
+    return [self writeMetadata:error];
+}
+
+- (BOOL)deleteDrawerID:(NSString *)drawerID error:(NSError **)error {
+    if (_mutableDrawers.count <= 1) {
+        if (error) *error = SDError(3, @"至少需要保留一个抽屉。");
+        return NO;
+    }
+    NSMutableDictionary *drawer = [self mutableDrawerForID:drawerID];
+    if (!drawer) return YES;
+    if ([self itemsForDrawerID:drawerID].count > 0) {
+        if (error) *error = SDError(4, @"抽屉里还有文件，请先拖出或保存为文件夹。");
+        return NO;
+    }
+    if (![NSFileManager.defaultManager removeItemAtURL:[self directoryForDrawer:drawer] error:error]) return NO;
+    [_mutableDrawers removeObject:drawer];
+    return [self writeMetadata:error];
+}
+
+// ai coding: 仅删除空收纳盒并始终保留至少一个可用收纳盒 2026/09/17: 11:38
+- (BOOL)hasDeletableEmptyDrawers {
+    if (_mutableDrawers.count <= 1) return NO;
+    NSUInteger emptyCount = 0;
+    for (NSDictionary *drawer in _mutableDrawers) {
+        if ([self itemsForDrawerID:drawer[@"id"]].count == 0) emptyCount += 1;
+    }
+    return emptyCount > 0;
+}
+
+- (NSUInteger)deleteEmptyDrawers:(NSError **)error {
+    if (_mutableDrawers.count <= 1) return 0;
+    NSUInteger removedCount = 0;
+    NSArray<NSDictionary *> *drawers = [_mutableDrawers copy];
+    for (NSDictionary *drawer in drawers) {
+        if (_mutableDrawers.count <= 1) break;
+        NSString *drawerID = drawer[@"id"];
+        if ([self itemsForDrawerID:drawerID].count > 0) continue;
+        if (![NSFileManager.defaultManager removeItemAtURL:[self directoryForDrawer:drawer] error:error]) break;
+        [_mutableDrawers removeObject:(NSMutableDictionary *)drawer];
+        removedCount += 1;
+    }
+    if (removedCount > 0 && ![self writeMetadata:error]) return removedCount;
+    return removedCount;
+}
+
+- (BOOL)importURLs:(NSArray<NSURL *> *)urls drawerID:(NSString *)drawerID error:(NSError **)error {
+    NSDictionary *drawer = [self drawerForID:drawerID];
+    if (!drawer) {
+        if (error) *error = SDError(5, @"找不到这个抽屉。");
+        return NO;
+    }
+    NSString *storagePath = _rootURL.URLByStandardizingPath.path;
+    NSURL *destinationDirectory = [self directoryForDrawer:drawer];
+    for (NSURL *inputURL in urls) {
+        NSURL *sourceURL = inputURL.URLByStandardizingPath;
+        if ([sourceURL.path hasPrefix:storagePath]) {
+            if (error) *error = SDError(6, @"不能把 SideDrawer 自己的存储目录放进抽屉。");
+            return NO;
+        }
+        BOOL accessed = [sourceURL startAccessingSecurityScopedResource];
+        NSURL *destination = [self uniqueDestinationForURL:sourceURL inDirectory:destinationDirectory];
+        BOOL moved = [NSFileManager.defaultManager moveItemAtURL:sourceURL toURL:destination error:error];
+        if (accessed) [sourceURL stopAccessingSecurityScopedResource];
+        if (!moved) return NO;
+    }
+    return YES;
+}
+
+- (BOOL)moveItem:(NSURL *)itemURL toDirectory:(NSURL *)directory error:(NSError **)error {
+    BOOL accessed = [directory startAccessingSecurityScopedResource];
+    NSURL *destination = [self uniqueDestinationForURL:itemURL inDirectory:directory];
+    BOOL moved = [NSFileManager.defaultManager moveItemAtURL:itemURL toURL:destination error:error];
+    if (accessed) [directory stopAccessingSecurityScopedResource];
+    return moved;
+}
+
+- (NSURL *)saveDrawerID:(NSString *)drawerID inDirectory:(NSURL *)directory error:(NSError **)error {
+    NSDictionary *drawer = [self drawerForID:drawerID];
+    if (!drawer) {
+        if (error) *error = SDError(7, @"找不到这个抽屉。");
+        return nil;
+    }
+    BOOL accessed = [directory startAccessingSecurityScopedResource];
+    NSURL *destinationFolder = [self uniqueFolderNamed:drawer[@"name"] inDirectory:directory];
+    NSFileManager *manager = NSFileManager.defaultManager;
+    if (![manager createDirectoryAtURL:destinationFolder withIntermediateDirectories:NO attributes:nil error:error]) {
+        if (accessed) [directory stopAccessingSecurityScopedResource];
+        return nil;
+    }
+    for (NSURL *itemURL in [self itemsForDrawerID:drawerID]) {
+        NSURL *destination = [self uniqueDestinationForURL:itemURL inDirectory:destinationFolder];
+        if (![manager moveItemAtURL:itemURL toURL:destination error:error]) {
+            if (accessed) [directory stopAccessingSecurityScopedResource];
+            return nil;
+        }
+    }
+    if (accessed) [directory stopAccessingSecurityScopedResource];
+    return destinationFolder;
+}
+
+- (void)updateDrawerID:(NSString *)drawerID edge:(NSString *)edge position:(CGFloat)position {
+    NSMutableDictionary *drawer = [self mutableDrawerForID:drawerID];
+    if (!drawer) return;
+    drawer[@"edge"] = edge;
+    drawer[@"position"] = @(MAX(0, MIN(1, position)));
+    [self writeMetadata:nil];
+}
+
+- (void)updateDrawerID:(NSString *)drawerID locked:(BOOL)locked {
+    NSMutableDictionary *drawer = [self mutableDrawerForID:drawerID];
+    if (!drawer) return;
+    drawer[@"locked"] = @(locked);
+    [self writeMetadata:nil];
+}
+
+// ai coding: 按吸附方向持久化抽屉长度，切换方向后可恢复各自尺寸 2026/09/17: 08:40
+- (void)updateDrawerID:(NSString *)drawerID length:(CGFloat)length forEdge:(NSString *)edge {
+    NSMutableDictionary *drawer = [self mutableDrawerForID:drawerID];
+    if (!drawer) return;
+    drawer[SDEdgeIsHorizontal(edge) ? @"horizontalLength" : @"verticalLength"] = @(length);
+    [self writeMetadata:nil];
+}
+
+// ai coding: 持久化上下贴边高度或左右贴边宽度，供菜单手动设置使用 2026/09/17: 14:10
+- (void)updateDrawerID:(NSString *)drawerID thickness:(CGFloat)thickness forEdge:(NSString *)edge {
+    NSMutableDictionary *drawer = [self mutableDrawerForID:drawerID];
+    if (!drawer) return;
+    drawer[SDEdgeIsHorizontal(edge) ? @"horizontalThickness" : @"verticalThickness"] = @(thickness);
+    [self writeMetadata:nil];
+}
+
+- (void)loadMetadata {
+    NSData *data = [NSData dataWithContentsOfURL:_metadataURL];
+    id object = data ? [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil] : nil;
+    _mutableDrawers = [object isKindOfClass:NSArray.class] ? [object mutableCopy] : [NSMutableArray array];
+    NSInteger index = 0;
+    for (NSMutableDictionary *drawer in _mutableDrawers) {
+        if (!drawer[@"edge"]) drawer[@"edge"] = SDEdgeRight;
+        if (!drawer[@"position"]) drawer[@"position"] = @(0.05 + (index % 5) * 0.2);
+        // ai coding: 为旧版抽屉补齐可调长度字段并保留原有长边尺寸 2026/09/17: 08:40
+        if (!drawer[@"locked"]) drawer[@"locked"] = @NO;
+        if (!drawer[@"horizontalLength"]) drawer[@"horizontalLength"] = @580;
+        if (!drawer[@"verticalLength"]) drawer[@"verticalLength"] = @430;
+        // ai coding: 为旧版抽屉补齐菜单尺寸字段并保留原有默认厚度 2026/09/17: 14:10
+        if (!drawer[@"horizontalThickness"]) drawer[@"horizontalThickness"] = @66;
+        if (!drawer[@"verticalThickness"]) drawer[@"verticalThickness"] = @95;
+        [NSFileManager.defaultManager createDirectoryAtURL:[self directoryForDrawer:drawer]
+                               withIntermediateDirectories:YES attributes:nil error:nil];
+        index += 1;
+    }
+    [self writeMetadata:nil];
+}
+
+- (BOOL)createDefaultDrawer:(NSError **)error {
+    // ai coding: 默认抽屉同时初始化横向与纵向长度 2026/09/17: 08:40
+    NSMutableDictionary *drawer = [@{
+        @"id": NSUUID.UUID.UUIDString,
+        @"name": @"收纳箱",
+        @"edge": SDEdgeRight,
+        @"position": @0.5,
+        @"locked": @NO,
+        @"horizontalLength": @580,
+        @"verticalLength": @430,
+        @"horizontalThickness": @66,
+        @"verticalThickness": @95
+    } mutableCopy];
+    _mutableDrawers = [NSMutableArray arrayWithObject:drawer];
+    if (![NSFileManager.defaultManager createDirectoryAtURL:[self directoryForDrawer:drawer]
+                                withIntermediateDirectories:YES attributes:nil error:error]) return NO;
+    return [self writeMetadata:error];
+}
+
+- (BOOL)writeMetadata:(NSError **)error {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:_mutableDrawers
+                                                   options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:error];
+    return data && [data writeToURL:_metadataURL options:NSDataWritingAtomic error:error];
+}
+
+- (NSURL *)directoryForDrawer:(NSDictionary *)drawer {
+    return [_drawersURL URLByAppendingPathComponent:drawer[@"id"] isDirectory:YES];
+}
+
+- (NSURL *)uniqueDestinationForURL:(NSURL *)sourceURL inDirectory:(NSURL *)directory {
+    NSFileManager *manager = NSFileManager.defaultManager;
+    NSURL *candidate = [directory URLByAppendingPathComponent:sourceURL.lastPathComponent];
+    if (![manager fileExistsAtPath:candidate.path]) return candidate;
+    NSNumber *isDirectory = nil;
+    [sourceURL getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:nil];
+    NSString *extension = isDirectory.boolValue ? @"" : sourceURL.pathExtension;
+    NSString *baseName = extension.length ? sourceURL.URLByDeletingPathExtension.lastPathComponent : sourceURL.lastPathComponent;
+    NSInteger index = 2;
+    do {
+        NSString *name = extension.length
+            ? [NSString stringWithFormat:@"%@ %ld.%@", baseName, (long)index, extension]
+            : [NSString stringWithFormat:@"%@ %ld", baseName, (long)index];
+        candidate = [directory URLByAppendingPathComponent:name isDirectory:isDirectory.boolValue];
+        index += 1;
+    } while ([manager fileExistsAtPath:candidate.path]);
+    return candidate;
+}
+
+- (NSURL *)uniqueFolderNamed:(NSString *)rawName inDirectory:(NSURL *)directory {
+    NSString *name = [self sanitizedName:rawName];
+    NSURL *candidate = [directory URLByAppendingPathComponent:name isDirectory:YES];
+    NSInteger index = 2;
+    while ([NSFileManager.defaultManager fileExistsAtPath:candidate.path]) {
+        candidate = [directory URLByAppendingPathComponent:[NSString stringWithFormat:@"%@ %ld", name, (long)index]
+                                               isDirectory:YES];
+        index += 1;
+    }
+    return candidate;
+}
+
+- (NSString *)sanitizedName:(NSString *)name {
+    NSString *clean = [name stringByReplacingOccurrencesOfString:@"/" withString:@"-"];
+    clean = [clean stringByReplacingOccurrencesOfString:@":" withString:@"-"];
+    return [clean stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+@end
+
+@interface SDFlippedView : NSView
+@end
+@implementation SDFlippedView
+- (BOOL)isFlipped { return YES; }
+@end
+
+// ai coding: 修正调节方向并允许缩短到单个文件卡片尺寸 2026/09/17: 13:41
+@interface SDLengthResizeHandleView : NSView
+@property(nonatomic) BOOL horizontal;
+@end
+
+@implementation SDLengthResizeHandleView {
+    NSRect _startFrame;
+    NSPoint _startScreenPoint;
+}
+
+- (BOOL)mouseDownCanMoveWindow { return NO; }
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
+
+- (void)resetCursorRects {
+    [self addCursorRect:self.bounds cursor:self.horizontal ? NSCursor.resizeLeftRightCursor : NSCursor.resizeUpDownCursor];
+}
+
+- (void)mouseDown:(NSEvent *)event {
+    _startFrame = self.window.frame;
+    _startScreenPoint = [self.window convertPointToScreen:event.locationInWindow];
+}
+
+- (void)mouseDragged:(NSEvent *)event {
+    NSPoint point = [self.window convertPointToScreen:event.locationInWindow];
+    NSRect frame = _startFrame;
+    NSScreen *screen = self.window.screen ?: NSScreen.mainScreen;
+    NSRect visible = screen ? screen.visibleFrame : NSMakeRect(0, 0, 1600, 1000);
+    if (self.horizontal) {
+        CGFloat maximum = MAX(SDHorizontalMinimumLength, NSMaxX(visible) - NSMinX(frame));
+        frame.size.width = MAX(SDHorizontalMinimumLength,
+                               MIN(maximum, _startFrame.size.width + point.x - _startScreenPoint.x));
+    } else {
+        CGFloat fixedTop = NSMaxY(_startFrame);
+        CGFloat maximum = MAX(SDVerticalMinimumLength, fixedTop - NSMinY(visible));
+        frame.size.height = MAX(SDVerticalMinimumLength,
+                                 MIN(maximum, _startFrame.size.height - (point.y - _startScreenPoint.y)));
+        frame.origin.y = fixedTop - frame.size.height;
+    }
+    [self.window setFrame:frame display:YES];
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    [super drawRect:dirtyRect];
+    [[NSColor.secondaryLabelColor colorWithAlphaComponent:0.55] setStroke];
+    NSBezierPath *path = [NSBezierPath bezierPath];
+    path.lineWidth = 1.2;
+    for (NSInteger index = -1; index <= 1; index++) {
+        if (self.horizontal) {
+            CGFloat x = NSMidX(self.bounds) + index * 2.5;
+            [path moveToPoint:NSMakePoint(x, NSMidY(self.bounds) - 6)];
+            [path lineToPoint:NSMakePoint(x, NSMidY(self.bounds) + 6)];
+        } else {
+            CGFloat y = NSMidY(self.bounds) + index * 2.5;
+            [path moveToPoint:NSMakePoint(NSMidX(self.bounds) - 6, y)];
+            [path lineToPoint:NSMakePoint(NSMidX(self.bounds) + 6, y)];
+        }
+    }
+    [path stroke];
+}
+@end
+
+// ai coding: 让 Quick Look 预览窗口接收鼠标进入和离开事件，支持在预览内滚动长文本 2026/09/17: 13:58
+@interface SDHoverPreviewView : NSVisualEffectView
+@property(nonatomic, copy) void (^enteredHandler)(void);
+@property(nonatomic, copy) void (^exitedHandler)(void);
+@end
+
+@implementation SDHoverPreviewView
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    NSTrackingArea *trackingArea = [[NSTrackingArea alloc]
+        initWithRect:NSZeroRect
+              options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                      NSTrackingInVisibleRect
+                owner:self
+             userInfo:nil];
+    [self addTrackingArea:trackingArea];
+    return self;
+}
+
+- (void)mouseEntered:(NSEvent *)event {
+    [super mouseEntered:event];
+    if (self.enteredHandler) self.enteredHandler();
+}
+
+- (void)mouseExited:(NSEvent *)event {
+    [super mouseExited:event];
+    if (self.exitedHandler) self.exitedHandler();
+}
+@end
+
+// ai coding: 压缩横向文件项并增加文件悬停预览能力 2026/09/17: 13:50
+@interface SDFileTileView : NSView <NSDraggingSource>
+@property(nonatomic, getter=isSelected) BOOL selected;
+@property(nonatomic, readonly) NSURL *url;
+- (instancetype)initWithURL:(NSURL *)url iconOnTop:(BOOL)iconOnTop completion:(void (^)(void))completion
+                moveHandler:(void (^)(NSURL *itemURL, NSURL *directoryURL))moveHandler
+            selectionHandler:(void (^)(NSURL *itemURL, BOOL toggle))selectionHandler
+           dragURLsProvider:(NSArray<NSURL *> *(^)(NSURL *itemURL))dragURLsProvider;
+@end
+
+@implementation SDFileTileView {
+    NSURL *_url;
+    BOOL _iconOnTop;
+    NSImageView *_iconView;
+    NSTextField *_label;
+    void (^_completion)(void);
+    void (^_moveHandler)(NSURL *, NSURL *);
+    void (^_selectionHandler)(NSURL *, BOOL);
+    NSArray<NSURL *> *(^_dragURLsProvider)(NSURL *);
+    BOOL _selected;
+    BOOL _isDirectory;
+    NSPanel *_previewPanel;
+    QLPreviewView *_previewView;
+    BOOL _tileHovered;
+    BOOL _previewHovered;
+    BOOL _draggedAfterMouseDown;
+    BOOL _collapseSelectionOnMouseUp;
+}
+
+// ai coding: 文件卡片销毁时关闭 Quick Look，避免悬停预览窗口残留 2026/09/17: 14:01
+- (void)dealloc {
+    [_previewPanel orderOut:nil];
+    [_previewView close];
+}
+
+- (instancetype)initWithURL:(NSURL *)url iconOnTop:(BOOL)iconOnTop completion:(void (^)(void))completion
+                moveHandler:(void (^)(NSURL *, NSURL *))moveHandler
+            selectionHandler:(void (^)(NSURL *, BOOL))selectionHandler
+           dragURLsProvider:(NSArray<NSURL *> *(^)(NSURL *))dragURLsProvider {
+    self = [super initWithFrame:NSZeroRect];
+    if (!self) return nil;
+    _url = url;
+    _iconOnTop = iconOnTop;
+    _completion = [completion copy];
+    _moveHandler = [moveHandler copy];
+    _selectionHandler = [selectionHandler copy];
+    _dragURLsProvider = [dragURLsProvider copy];
+    BOOL isDirectory = NO;
+    [NSFileManager.defaultManager fileExistsAtPath:url.path isDirectory:&isDirectory];
+    _isDirectory = isDirectory;
+    self.wantsLayer = YES;
+    self.layer.cornerRadius = 9;
+    self.layer.backgroundColor = [NSColor.controlBackgroundColor colorWithAlphaComponent:0.38].CGColor;
+    self.toolTip = url.path;
+    _iconView = [[NSImageView alloc] initWithFrame:NSZeroRect];
+    _iconView.image = [NSWorkspace.sharedWorkspace iconForFile:url.path];
+    _iconView.imageScaling = NSImageScaleProportionallyUpOrDown;
+    [self addSubview:_iconView];
+    _label = [NSTextField labelWithString:url.lastPathComponent];
+    _label.alignment = iconOnTop ? NSTextAlignmentCenter : NSTextAlignmentLeft;
+    _label.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    _label.font = [NSFont systemFontOfSize:_iconOnTop ? 9 : 10 weight:NSFontWeightMedium];
+    [self addSubview:_label];
+    // ai coding: 监听文件卡片悬停并延迟显示 Quick Look，避免拖拽时误触预览 2026/09/17: 13:50
+    NSTrackingArea *trackingArea = [[NSTrackingArea alloc]
+        initWithRect:NSZeroRect
+              options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                      NSTrackingInVisibleRect
+                owner:self
+             userInfo:nil];
+    [self addTrackingArea:trackingArea];
+    return self;
+}
+
+- (BOOL)isSelected { return _selected; }
+- (NSURL *)url { return _url; }
+
+- (void)setSelected:(BOOL)selected {
+    _selected = selected;
+    self.layer.backgroundColor = selected
+        ? [NSColor.controlAccentColor colorWithAlphaComponent:0.28].CGColor
+        : [NSColor.controlBackgroundColor colorWithAlphaComponent:0.38].CGColor;
+    self.layer.borderWidth = selected ? 2.0 : 0.0;
+    self.layer.borderColor = [NSColor.controlAccentColor colorWithAlphaComponent:0.95].CGColor;
+}
+
+- (NSSize)intrinsicContentSize { return _iconOnTop ? NSMakeSize(72, 42) : NSMakeSize(79, 46); }
+
+// ai coding: 创建紧凑磨砂 Quick Look 预览窗口并根据抽屉位置自动避让屏幕边缘 2026/09/17: 13:50
+- (void)showHoverPreview {
+    if (_isDirectory || ![NSFileManager.defaultManager fileExistsAtPath:_url.path]) return;
+    NSScreen *screen = self.window.screen ?: NSScreen.mainScreen;
+    if (!screen) return;
+    if (!_previewPanel) {
+        _previewPanel = [[NSPanel alloc]
+            initWithContentRect:NSMakeRect(0, 0, 320, 240)
+                      styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+                        backing:NSBackingStoreBuffered
+                          defer:NO];
+        _previewPanel.opaque = NO;
+        _previewPanel.backgroundColor = NSColor.clearColor;
+        _previewPanel.hasShadow = YES;
+        _previewPanel.level = NSStatusWindowLevel;
+        _previewPanel.floatingPanel = YES;
+        _previewPanel.hidesOnDeactivate = NO;
+        _previewPanel.becomesKeyOnlyIfNeeded = YES;
+        _previewPanel.ignoresMouseEvents = NO;
+        _previewPanel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                            NSWindowCollectionBehaviorFullScreenAuxiliary;
+        SDHoverPreviewView *background = [[SDHoverPreviewView alloc]
+            initWithFrame:NSMakeRect(0, 0, 320, 240)];
+        background.material = NSVisualEffectMaterialPopover;
+        background.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+        background.state = NSVisualEffectStateActive;
+        background.wantsLayer = YES;
+        background.layer.cornerRadius = 14;
+        background.layer.masksToBounds = YES;
+        _previewView = [[QLPreviewView alloc]
+            initWithFrame:NSMakeRect(8, 8, 304, 224)
+                    style:QLPreviewViewStyleCompact];
+        _previewView.autostarts = NO;
+        [background addSubview:_previewView];
+        _previewPanel.contentView = background;
+        __weak typeof(self) weakSelf = self;
+        background.enteredHandler = ^{ [weakSelf previewDidEnter]; };
+        background.exitedHandler = ^{ [weakSelf previewDidExit]; };
+    }
+    _previewView.previewItem = _url;
+    NSRect tileInWindow = [self convertRect:self.bounds toView:nil];
+    NSRect tileRect = [self.window convertRectToScreen:tileInWindow];
+    NSRect visible = screen.visibleFrame;
+    NSSize previewSize = _previewPanel.frame.size;
+    NSPoint origin = NSMakePoint(NSMidX(tileRect) - previewSize.width / 2,
+                                 NSMaxY(tileRect) + 8);
+    if (_iconOnTop) {
+        if (NSMinY(tileRect) > NSMidY(visible)) origin.y = NSMinY(tileRect) - previewSize.height - 8;
+    } else if (NSMinX(tileRect) > NSMidX(visible)) {
+        origin.x = NSMinX(tileRect) - previewSize.width - 8;
+        origin.y = NSMidY(tileRect) - previewSize.height / 2;
+    } else {
+        origin.x = NSMaxX(tileRect) + 8;
+        origin.y = NSMidY(tileRect) - previewSize.height / 2;
+    }
+    origin.x = MAX(NSMinX(visible) + 8, MIN(origin.x, NSMaxX(visible) - previewSize.width - 8));
+    origin.y = MAX(NSMinY(visible) + 8, MIN(origin.y, NSMaxY(visible) - previewSize.height - 8));
+    [_previewPanel setFrame:NSMakeRect(origin.x, origin.y, previewSize.width, previewSize.height) display:NO];
+    [_previewPanel orderFrontRegardless];
+}
+
+// ai coding: 在文件卡片和预览窗口之间保持悬停状态，允许滚动长文本内容 2026/09/17: 13:58
+- (void)previewDidEnter {
+    _previewHovered = YES;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(hideHoverPreviewIfPointerLeft) object:nil];
+}
+
+- (void)previewDidExit {
+    _previewHovered = NO;
+    [self performSelector:@selector(hideHoverPreviewIfPointerLeft) withObject:nil afterDelay:0.18];
+}
+
+- (void)hideHoverPreviewIfPointerLeft {
+    if (_tileHovered || _previewHovered) return;
+    [_previewPanel orderOut:nil];
+}
+
+// ai coding: 鼠标离开文件卡片或开始拖拽时关闭悬停预览 2026/09/17: 13:58
+- (void)hideHoverPreview {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(showHoverPreview) object:nil];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(hideHoverPreviewIfPointerLeft) object:nil];
+    _tileHovered = NO;
+    _previewHovered = NO;
+    [_previewPanel orderOut:nil];
+}
+
+- (void)mouseEntered:(NSEvent *)event {
+    [super mouseEntered:event];
+    if (_isDirectory) return;
+    _tileHovered = YES;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(hideHoverPreviewIfPointerLeft) object:nil];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(showHoverPreview) object:nil];
+    [self performSelector:@selector(showHoverPreview) withObject:nil afterDelay:0.22];
+}
+
+- (void)mouseExited:(NSEvent *)event {
+    [super mouseExited:event];
+    _tileHovered = NO;
+    [self performSelector:@selector(hideHoverPreviewIfPointerLeft) withObject:nil afterDelay:0.18];
+}
+
+- (void)layout {
+    [super layout];
+    if (_iconOnTop) {
+        _iconView.frame = NSMakeRect((self.bounds.size.width - 24) / 2, 16, 24, 24);
+        _label.frame = NSMakeRect(4, 2, self.bounds.size.width - 8, 12);
+    } else {
+        _iconView.frame = NSMakeRect(5, 9, 28, 28);
+        _label.frame = NSMakeRect(37, 13, self.bounds.size.width - 41, 19);
+    }
+}
+
+// ai coding: 让首次点击文件即可激活抽屉并接收 Command+A 等快捷键 2026/09/17: 09:53
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
+
+- (void)mouseDown:(NSEvent *)event {
+    [self hideHoverPreview];
+    [NSApp activateIgnoringOtherApps:YES];
+    [self.window makeKeyWindow];
+    _draggedAfterMouseDown = NO;
+    _collapseSelectionOnMouseUp = NO;
+    BOOL commandDown = (event.modifierFlags & NSEventModifierFlagCommand) != 0;
+    if (commandDown) {
+        if (_selectionHandler) _selectionHandler(_url, YES);
+    } else if (!_selected) {
+        if (_selectionHandler) _selectionHandler(_url, NO);
+    } else {
+        _collapseSelectionOnMouseUp = YES;
+    }
+    if (event.clickCount == 2) {
+        _collapseSelectionOnMouseUp = NO;
+        [NSWorkspace.sharedWorkspace openURL:_url];
+    }
+}
+
+- (void)mouseUp:(NSEvent *)event {
+    if (_collapseSelectionOnMouseUp && !_draggedAfterMouseDown && event.clickCount == 1 && _selectionHandler) {
+        _selectionHandler(_url, NO);
+    }
+    _collapseSelectionOnMouseUp = NO;
+}
+
+- (BOOL)mouseDownCanMoveWindow { return NO; }
+
+- (void)mouseDragged:(NSEvent *)event {
+    [self hideHoverPreview];
+    _draggedAfterMouseDown = YES;
+    NSArray<NSURL *> *urls = _dragURLsProvider ? _dragURLsProvider(_url) : @[_url];
+    if (urls.count == 0) return;
+    NSMutableArray<NSDraggingItem *> *draggingItems = [NSMutableArray arrayWithCapacity:urls.count];
+    [urls enumerateObjectsUsingBlock:^(NSURL *url, NSUInteger index, BOOL *stop __unused) {
+        NSDraggingItem *item = [[NSDraggingItem alloc] initWithPasteboardWriter:url];
+        NSRect frame = NSInsetRect(self.bounds, 5, 5);
+        CGFloat offset = MIN(index, (NSUInteger)4) * 3.0;
+        frame.origin.x += offset;
+        frame.origin.y -= offset;
+        NSImage *icon = [NSWorkspace.sharedWorkspace iconForFile:url.path];
+        [item setDraggingFrame:frame contents:icon];
+        [draggingItems addObject:item];
+    }];
+    [self beginDraggingSessionWithItems:draggingItems event:event source:self];
+}
+
+- (NSDragOperation)draggingSession:(NSDraggingSession *)session sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
+    return NSDragOperationMove;
+}
+
+- (BOOL)ignoreModifierKeysForDraggingSession:(NSDraggingSession *)session { return YES; }
+
+- (void)draggingSession:(NSDraggingSession *)session endedAtPoint:(NSPoint)screenPoint operation:(NSDragOperation)operation {
+    if (!_completion) return;
+    for (NSNumber *delay in @[@0.0, @0.25, @0.8]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), _completion);
+    }
+}
+
+- (NSMenu *)menuForEvent:(NSEvent *)event {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"文件"];
+    NSMenuItem *open = [[NSMenuItem alloc] initWithTitle:@"打开" action:@selector(openItem:) keyEquivalent:@""];
+    open.target = self;
+    [menu addItem:open];
+    NSMenuItem *reveal = [[NSMenuItem alloc] initWithTitle:@"在 Finder 中显示" action:@selector(revealItem:) keyEquivalent:@""];
+    reveal.target = self;
+    [menu addItem:reveal];
+    [menu addItem:NSMenuItem.separatorItem];
+    NSMenuItem *move = [[NSMenuItem alloc] initWithTitle:@"移动到文件夹…" action:@selector(moveItem:) keyEquivalent:@""];
+    move.target = self;
+    [menu addItem:move];
+    return menu;
+}
+
+- (void)openItem:(id)sender { [NSWorkspace.sharedWorkspace openURL:_url]; }
+- (void)revealItem:(id)sender { [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[_url]]; }
+
+- (void)moveItem:(id)sender {
+    NSOpenPanel *panel = NSOpenPanel.openPanel;
+    panel.title = @"选择移动位置";
+    panel.prompt = @"移动到这里";
+    panel.canChooseFiles = NO;
+    panel.canChooseDirectories = YES;
+    panel.canCreateDirectories = YES;
+    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
+        if (response == NSModalResponseOK && self->_moveHandler) self->_moveHandler(self->_url, panel.URL);
+    }];
+}
+@end
+
+// ai coding: 同步压缩横向堆叠项，为右侧纵向操作按钮留出空间 2026/09/17: 09:19
+@interface SDPileView : NSView <NSDraggingSource>
+- (instancetype)initWithURLs:(NSArray<NSURL *> *)urls iconOnTop:(BOOL)iconOnTop completion:(void (^)(void))completion
+                  moveHandler:(void (^)(NSURL *, NSURL *))moveHandler
+             selectionHandler:(void (^)(NSURL *itemURL, BOOL toggle))selectionHandler
+            dragURLsProvider:(NSArray<NSURL *> *(^)(NSURL *itemURL))dragURLsProvider
+             selectedProvider:(BOOL (^)(NSURL *itemURL))selectedProvider;
+- (void)updateSelectionAppearance;
+@end
+
+@implementation SDPileView {
+    NSArray<NSURL *> *_urls;
+    BOOL _iconOnTop;
+    void (^_completion)(void);
+    void (^_moveHandler)(NSURL *, NSURL *);
+    void (^_selectionHandler)(NSURL *, BOOL);
+    NSArray<NSURL *> *(^_dragURLsProvider)(NSURL *);
+    BOOL (^_selectedProvider)(NSURL *);
+    NSPopover *_popover;
+    NSArray<SDFileTileView *> *_popoverTiles;
+    BOOL _draggedAfterMouseDown;
+}
+
+- (instancetype)initWithURLs:(NSArray<NSURL *> *)urls iconOnTop:(BOOL)iconOnTop completion:(void (^)(void))completion
+                  moveHandler:(void (^)(NSURL *, NSURL *))moveHandler
+             selectionHandler:(void (^)(NSURL *, BOOL))selectionHandler
+            dragURLsProvider:(NSArray<NSURL *> *(^)(NSURL *))dragURLsProvider
+             selectedProvider:(BOOL (^)(NSURL *))selectedProvider {
+    self = [super initWithFrame:NSZeroRect];
+    if (!self) return nil;
+    _urls = [urls copy];
+    _iconOnTop = iconOnTop;
+    _completion = [completion copy];
+    _moveHandler = [moveHandler copy];
+    _selectionHandler = [selectionHandler copy];
+    _dragURLsProvider = [dragURLsProvider copy];
+    _selectedProvider = [selectedProvider copy];
+    self.wantsLayer = YES;
+    self.layer.cornerRadius = 9;
+    self.layer.backgroundColor = [NSColor.controlBackgroundColor colorWithAlphaComponent:0.38].CGColor;
+    self.toolTip = [NSString stringWithFormat:@"其余 %ld 项", (long)urls.count];
+    return self;
+}
+
+- (void)updateSelectionAppearance {
+    BOOL hasSelection = NO;
+    for (NSURL *url in _urls) {
+        if (_selectedProvider && _selectedProvider(url)) {
+            hasSelection = YES;
+            break;
+        }
+    }
+    self.layer.backgroundColor = hasSelection
+        ? [NSColor.controlAccentColor colorWithAlphaComponent:0.28].CGColor
+        : [NSColor.controlBackgroundColor colorWithAlphaComponent:0.38].CGColor;
+    self.layer.borderWidth = hasSelection ? 2.0 : 0.0;
+    self.layer.borderColor = [NSColor.controlAccentColor colorWithAlphaComponent:0.95].CGColor;
+    for (NSUInteger index = 0; index < _popoverTiles.count && index < _urls.count; index++) {
+        _popoverTiles[index].selected = _selectedProvider && _selectedProvider(_urls[index]);
+    }
+}
+
+- (NSSize)intrinsicContentSize { return _iconOnTop ? NSMakeSize(72, 42) : NSMakeSize(79, 46); }
+
+- (void)drawRect:(NSRect)dirtyRect {
+    [super drawRect:dirtyRect];
+    CGFloat iconSize = _iconOnTop ? 24 : 28;
+    CGFloat baseX = _iconOnTop ? (self.bounds.size.width - iconSize) / 2 - 4 : 6;
+    CGFloat baseY = _iconOnTop ? 14 : 8;
+    NSInteger layers = MIN(3, _urls.count);
+    for (NSInteger index = layers - 1; index >= 0; index--) {
+        NSImage *icon = [NSWorkspace.sharedWorkspace iconForFile:_urls[(NSUInteger)index].path];
+        [icon drawInRect:NSMakeRect(baseX + index * 5, baseY + index * 3, iconSize, iconSize)];
+    }
+    NSString *count = [NSString stringWithFormat:@"+%ld", (long)_urls.count];
+    NSDictionary *attributes = @{NSFontAttributeName: [NSFont boldSystemFontOfSize:9], NSForegroundColorAttributeName: NSColor.labelColor};
+    NSSize size = [count sizeWithAttributes:attributes];
+    NSPoint point = _iconOnTop ? NSMakePoint((self.bounds.size.width - size.width) / 2, 1)
+                               : NSMakePoint(43, (self.bounds.size.height - size.height) / 2);
+    [count drawAtPoint:point withAttributes:attributes];
+}
+
+// ai coding: 让首次点击文件堆即可激活抽屉并接收键盘命令 2026/09/17: 09:53
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
+
+- (void)mouseDown:(NSEvent *)event {
+    [NSApp activateIgnoringOtherApps:YES];
+    [self.window makeKeyWindow];
+    _draggedAfterMouseDown = NO;
+}
+
+- (void)mouseUp:(NSEvent *)event {
+    if (!_draggedAfterMouseDown) [self showPopover];
+}
+
+- (BOOL)mouseDownCanMoveWindow { return NO; }
+
+- (void)mouseDragged:(NSEvent *)event {
+    _draggedAfterMouseDown = YES;
+    NSURL *selectedAnchor = nil;
+    for (NSURL *url in _urls) {
+        if (_selectedProvider && _selectedProvider(url)) {
+            selectedAnchor = url;
+            break;
+        }
+    }
+    NSArray<NSURL *> *urls = selectedAnchor && _dragURLsProvider ? _dragURLsProvider(selectedAnchor) : _urls;
+    if (urls.count == 0) return;
+    NSMutableArray<NSDraggingItem *> *draggingItems = [NSMutableArray arrayWithCapacity:urls.count];
+    [urls enumerateObjectsUsingBlock:^(NSURL *url, NSUInteger index, BOOL *stop __unused) {
+        NSDraggingItem *item = [[NSDraggingItem alloc] initWithPasteboardWriter:url];
+        NSRect frame = NSInsetRect(self.bounds, 5, 5);
+        CGFloat offset = MIN(index, (NSUInteger)4) * 3.0;
+        frame.origin.x += offset;
+        frame.origin.y -= offset;
+        [item setDraggingFrame:frame contents:[NSWorkspace.sharedWorkspace iconForFile:url.path]];
+        [draggingItems addObject:item];
+    }];
+    [self beginDraggingSessionWithItems:draggingItems event:event source:self];
+}
+
+- (NSDragOperation)draggingSession:(NSDraggingSession *)session sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
+    return NSDragOperationMove;
+}
+
+- (BOOL)ignoreModifierKeysForDraggingSession:(NSDraggingSession *)session { return YES; }
+
+- (void)draggingSession:(NSDraggingSession *)session endedAtPoint:(NSPoint)screenPoint operation:(NSDragOperation)operation {
+    if (!_completion) return;
+    for (NSNumber *delay in @[@0.0, @0.25, @0.8]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), _completion);
+    }
+}
+
+- (void)showPopover {
+    _popover = [[NSPopover alloc] init];
+    _popover.behavior = NSPopoverBehaviorTransient;
+    CGFloat documentHeight = MAX(58, _urls.count * 58);
+    SDFlippedView *document = [[SDFlippedView alloc] initWithFrame:NSMakeRect(0, 0, 250, documentHeight)];
+    __weak typeof(self) weakSelf = self;
+    void (^moveHandler)(NSURL *, NSURL *) = _moveHandler;
+    NSMutableArray<SDFileTileView *> *popoverTiles = [NSMutableArray arrayWithCapacity:_urls.count];
+    [_urls enumerateObjectsUsingBlock:^(NSURL *url, NSUInteger index, BOOL *stop __unused) {
+        SDFileTileView *tile = [[SDFileTileView alloc] initWithURL:url iconOnTop:NO completion:^{
+            SDPileView *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [strongSelf->_popover close];
+            if (strongSelf->_completion) strongSelf->_completion();
+        } moveHandler:moveHandler selectionHandler:self->_selectionHandler dragURLsProvider:self->_dragURLsProvider];
+        tile.selected = self->_selectedProvider && self->_selectedProvider(url);
+        tile.frame = NSMakeRect(8, index * 58 + 2, 234, 54);
+        [document addSubview:tile];
+        [popoverTiles addObject:tile];
+    }];
+    _popoverTiles = popoverTiles;
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 250, MIN(348, documentHeight))];
+    scroll.drawsBackground = NO;
+    scroll.hasVerticalScroller = documentHeight > 348;
+    scroll.documentView = document;
+    NSViewController *controller = [[NSViewController alloc] init];
+    controller.view = scroll;
+    _popover.contentViewController = controller;
+    _popover.contentSize = scroll.frame.size;
+    [_popover showRelativeToRect:self.bounds ofView:self preferredEdge:NSRectEdgeMinX];
+}
+@end
+
+// ai coding: 识别剪贴板文本中的常见 Markdown 结构并给粘贴文件选择扩展名 2026/09/17: 14:10
+static BOOL SDStringLooksLikeMarkdown(NSString *text) {
+    if (text.length == 0) return NO;
+    for (NSString *line in [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        NSString *trimmed = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if ([trimmed hasPrefix:@"```"] || [trimmed hasPrefix:@"> "]) return YES;
+        NSUInteger headingHashes = 0;
+        while (headingHashes < trimmed.length && [trimmed characterAtIndex:headingHashes] == '#') headingHashes += 1;
+        if (headingHashes > 0 && headingHashes <= 6 && headingHashes < trimmed.length &&
+            [trimmed characterAtIndex:headingHashes] == ' ') return YES;
+        if ([trimmed hasPrefix:@"- "] || [trimmed hasPrefix:@"* "] || [trimmed hasPrefix:@"+ "]) return YES;
+        NSUInteger digitCount = 0;
+        while (digitCount < trimmed.length && [trimmed characterAtIndex:digitCount] >= '0' &&
+               [trimmed characterAtIndex:digitCount] <= '9') digitCount += 1;
+        if (digitCount > 0 && digitCount + 1 < trimmed.length &&
+            [trimmed characterAtIndex:digitCount] == '.' && [trimmed characterAtIndex:digitCount + 1] == ' ') return YES;
+        if ([trimmed containsString:@"]("] || [trimmed containsString:@"**"] ||
+            [trimmed containsString:@"__"] || [trimmed containsString:@"| "] ||
+            ([trimmed hasPrefix:@"|"] && [trimmed containsString:@"|-"])) return YES;
+    }
+    return [text hasPrefix:@"---\n"] || [text hasPrefix:@"---\r\n"];
+}
+
+// ai coding: 将剪贴板图片写入临时 PNG 文件，随后交给现有文件导入流程移动到磁盘 2026/09/17: 14:10
+static NSURL *SDWritePastedImage(NSPasteboard *pasteboard, NSError **error) {
+    NSData *sourceData = [pasteboard dataForType:NSPasteboardTypePNG];
+    if (!sourceData) sourceData = [pasteboard dataForType:NSPasteboardTypeTIFF];
+    NSBitmapImageRep *bitmap = sourceData ? [[NSBitmapImageRep alloc] initWithData:sourceData] : nil;
+    if (!bitmap) {
+        NSImage *image = [[NSImage alloc] initWithPasteboard:pasteboard];
+        NSData *tiffData = [image TIFFRepresentation];
+        bitmap = tiffData ? [[NSBitmapImageRep alloc] initWithData:tiffData] : nil;
+    }
+    NSData *pngData = [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+    if (pngData.length == 0) {
+        if (error) *error = SDError(11, @"剪贴板中的图片无法读取。");
+        return nil;
+    }
+    // ai coding: 将图片粘贴文件前缀统一改为英文 paste 便于识别 2026/09/17: 14:44
+    NSString *name = [NSString stringWithFormat:@"paste-%@.png", NSUUID.UUID.UUIDString.lowercaseString];
+    NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:name]];
+    if (![pngData writeToURL:url options:NSDataWritingAtomic error:error]) return nil;
+    return url;
+}
+
+// ai coding: 将剪贴板文本按 Markdown 或纯文本保存为临时文件供收纳盒接管 2026/09/17: 14:10
+static NSURL *SDWritePastedText(NSString *text, BOOL markdown, NSError **error) {
+    NSString *extension = markdown ? @"md" : @"txt";
+    // ai coding: 将文本粘贴文件前缀统一改为英文 paste 便于识别 2026/09/17: 14:44
+    NSString *name = [NSString stringWithFormat:@"paste-%@.%@", NSUUID.UUID.UUIDString.lowercaseString, extension];
+    NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:name]];
+    NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (![data writeToURL:url options:NSDataWritingAtomic error:error]) return nil;
+    return url;
+}
+
+// ai coding: 隐藏数量和三个操作图标，并控制名称输入框仅在新建时自动聚焦 2026/09/17: 11:14
+@interface SDDrawerContentView : NSVisualEffectView <NSDraggingDestination, NSTextFieldDelegate>
+@property(nonatomic, copy) void (^deleteHandler)(NSString *drawerID);
+@property(nonatomic, copy) void (^newDrawerHandler)(void);
+@property(nonatomic, copy) void (^lockHandler)(BOOL locked);
+- (instancetype)initWithStore:(SDDrawerStore *)store drawerID:(NSString *)drawerID edge:(NSString *)edge;
+- (void)setDrawerEdge:(NSString *)edge;
+- (void)reloadContent;
+- (void)selectAllItems;
+- (void)beginRenaming;
+// ai coding: 暴露保存和删除所选项目操作供抽屉键盘快捷键调用 2026/09/17: 09:51
+- (void)saveDrawerAsFolder;
+- (void)deleteSelectedItems;
+// ai coding: 暴露 Command+V 粘贴文件、图片和文本到当前收纳盒的入口 2026/09/17: 14:10
+- (BOOL)pasteFromPasteboard;
+- (void)updateSelectionForURL:(NSURL *)url toggle:(BOOL)toggle;
+- (NSArray<NSURL *> *)draggingURLsForAnchorURL:(NSURL *)anchorURL;
+- (BOOL)isURLSelected:(NSURL *)url;
+- (void)updateSelectionAppearance;
+- (void)setDropTargetActive:(BOOL)active;
+@end
+
+@implementation SDDrawerContentView {
+    SDDrawerStore *_store;
+    NSString *_drawerID;
+    NSString *_edge;
+    NSTextField *_nameField;
+    NSStackView *_itemStack;
+    NSButton *_lockButton;
+    BOOL _locked;
+    NSSize _lastMaskSize;
+    NSMutableSet<NSString *> *_selectedPaths;
+    NSArray<NSURL *> *_itemURLs;
+    NSMutableArray<SDFileTileView *> *_visibleTiles;
+    SDPileView *_pileView;
+    NSView *_dropOverlay;
+    BOOL _dropTargetActive;
+}
+
+- (instancetype)initWithStore:(SDDrawerStore *)store drawerID:(NSString *)drawerID edge:(NSString *)edge {
+    self = [super initWithFrame:NSZeroRect];
+    if (!self) return nil;
+    _store = store;
+    _drawerID = [drawerID copy];
+    _edge = [edge copy];
+    _locked = [[store drawerForID:drawerID][@"locked"] boolValue];
+    _selectedPaths = [NSMutableSet set];
+    _visibleTiles = [NSMutableArray array];
+    self.material = NSVisualEffectMaterialHUDWindow;
+    self.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+    self.state = NSVisualEffectStateActive;
+    self.wantsLayer = YES;
+    self.layer.cornerRadius = 18;
+    self.layer.masksToBounds = YES;
+    self.layer.borderWidth = 0.5;
+    self.layer.borderColor = [NSColor.whiteColor colorWithAlphaComponent:0.24].CGColor;
+    self.layer.backgroundColor = NSColor.clearColor.CGColor;
+    [self registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
+    [self rebuildLayout];
+    return self;
+}
+
+- (BOOL)acceptsFirstResponder { return YES; }
+
+- (void)layout {
+    [super layout];
+    if (NSEqualSizes(_lastMaskSize, self.bounds.size) || self.bounds.size.width <= 0 || self.bounds.size.height <= 0) return;
+    _lastMaskSize = self.bounds.size;
+    NSImage *mask = [[NSImage alloc] initWithSize:self.bounds.size];
+    [mask lockFocus];
+    [NSColor.clearColor setFill];
+    NSRectFill(NSMakeRect(0, 0, self.bounds.size.width, self.bounds.size.height));
+    [NSColor.whiteColor setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(0, 0, self.bounds.size.width, self.bounds.size.height)
+                                     xRadius:18
+                                     yRadius:18] fill];
+    [mask unlockFocus];
+    self.maskImage = mask;
+}
+
+- (void)setDrawerEdge:(NSString *)edge {
+    if ([_edge isEqualToString:edge]) return;
+    _edge = [edge copy];
+    [self rebuildLayout];
+}
+
+- (void)rebuildLayout {
+    for (NSView *view in self.subviews.copy) [view removeFromSuperview];
+    BOOL horizontal = SDEdgeIsHorizontal(_edge);
+    _nameField = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    _nameField.bezeled = NO;
+    _nameField.bordered = NO;
+    _nameField.drawsBackground = NO;
+    _nameField.focusRingType = NSFocusRingTypeNone;
+    // ai coding: 明确启用收纳盒名称的键盘编辑和选择能力 2026/09/17: 10:40
+    _nameField.editable = YES;
+    _nameField.selectable = YES;
+    _nameField.enabled = YES;
+    _nameField.font = [NSFont boldSystemFontOfSize:11];
+    _nameField.lineBreakMode = NSLineBreakByTruncatingTail;
+    _nameField.delegate = self;
+    NSStackView *titleRow = [[NSStackView alloc] initWithFrame:NSZeroRect];
+    titleRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    titleRow.alignment = NSLayoutAttributeCenterY;
+    titleRow.translatesAutoresizingMaskIntoConstraints = NO;
+    [titleRow addArrangedSubview:_nameField];
+    [_nameField setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    // ai coding: 窄抽屉中允许名称压缩，为单个文件卡片保留可用宽度 2026/09/17: 13:41
+    [_nameField.widthAnchor constraintGreaterThanOrEqualToConstant:20].active = YES;
+    [self addSubview:titleRow];
+
+    _lockButton = [self iconButton:_locked ? @"pin.fill" : @"pin"
+                              help:_locked ? @"取消固定" : @"固定抽屉"
+                            action:@selector(toggleLocked:)];
+    _lockButton.contentTintColor = _locked ? NSColor.controlAccentColor : NSColor.secondaryLabelColor;
+    _lockButton.translatesAutoresizingMaskIntoConstraints = NO;
+    _lockButton.image = SDRotatedPinSymbol(_locked);
+    [self addSubview:_lockButton];
+
+    // ai coding: 在抽屉顶部增加删除当前收纳盒的关闭按钮 2026/09/17: 10:40
+    NSButton *closeButton = [self iconButton:@"xmark.circle.fill"
+                                       help:@"删除当前收纳盒"
+                                     action:@selector(deleteDrawer:)];
+    closeButton.contentTintColor = NSColor.secondaryLabelColor;
+    closeButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:closeButton];
+
+    _itemStack = [[NSStackView alloc] initWithFrame:NSZeroRect];
+    _itemStack.orientation = horizontal ? NSUserInterfaceLayoutOrientationHorizontal : NSUserInterfaceLayoutOrientationVertical;
+    _itemStack.alignment = horizontal ? NSLayoutAttributeCenterY : NSLayoutAttributeCenterX;
+    _itemStack.spacing = horizontal ? 4 : 3;
+    _itemStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:_itemStack];
+
+    SDLengthResizeHandleView *resizeHandle = [[SDLengthResizeHandleView alloc] initWithFrame:NSZeroRect];
+    resizeHandle.horizontal = horizontal;
+    resizeHandle.toolTip = @"拖动调整抽屉长度";
+    resizeHandle.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:resizeHandle];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [titleRow.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:7],
+        [titleRow.topAnchor constraintEqualToAnchor:self.topAnchor constant:4],
+        [titleRow.trailingAnchor constraintLessThanOrEqualToAnchor:_lockButton.leadingAnchor constant:-3],
+        [_lockButton.topAnchor constraintEqualToAnchor:self.topAnchor constant:3],
+        [_lockButton.trailingAnchor constraintEqualToAnchor:closeButton.leadingAnchor constant:-1],
+        [closeButton.topAnchor constraintEqualToAnchor:self.topAnchor constant:3],
+        [closeButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-4]
+    ]];
+    if (horizontal) {
+        // ai coding: 隐藏操作图标后让横向文件区重新居中并释放右侧空间 2026/09/17: 10:33
+        // ai coding: 让单个文件卡片在极窄横向抽屉中仍能完整显示 2026/09/17: 13:41
+        NSLayoutConstraint *itemLeading = [_itemStack.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.leadingAnchor constant:0];
+        NSLayoutConstraint *itemTrailing = [_itemStack.trailingAnchor constraintLessThanOrEqualToAnchor:self.trailingAnchor constant:0];
+        itemLeading.priority = NSLayoutPriorityDefaultLow;
+        itemTrailing.priority = NSLayoutPriorityDefaultLow;
+        [NSLayoutConstraint activateConstraints:@[
+            [_itemStack.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+            [_itemStack.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+            itemLeading,
+            itemTrailing,
+            [resizeHandle.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+            [resizeHandle.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+            [resizeHandle.widthAnchor constraintEqualToConstant:9],
+            [resizeHandle.heightAnchor constraintEqualToConstant:34]
+        ]];
+    } else {
+        // ai coding: 将左右吸附抽屉的长度调节柄放到底部水平居中 2026/09/17: 10:36
+        // ai coding: 极短纵向抽屉优先保持文件卡片尺寸而允许与边缘控件重叠 2026/09/17: 13:41
+        NSLayoutConstraint *itemTop = [_itemStack.topAnchor constraintGreaterThanOrEqualToAnchor:self.topAnchor constant:0];
+        NSLayoutConstraint *itemBottom = [_itemStack.bottomAnchor constraintLessThanOrEqualToAnchor:self.bottomAnchor constant:0];
+        itemTop.priority = NSLayoutPriorityDefaultLow;
+        itemBottom.priority = NSLayoutPriorityDefaultLow;
+        [NSLayoutConstraint activateConstraints:@[
+            [_itemStack.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+            [_itemStack.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+            itemTop,
+            itemBottom,
+            [resizeHandle.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+            [resizeHandle.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+            [resizeHandle.widthAnchor constraintEqualToConstant:34],
+            [resizeHandle.heightAnchor constraintEqualToConstant:9]
+        ]];
+    }
+
+    _dropOverlay = [[NSView alloc] initWithFrame:NSZeroRect];
+    _dropOverlay.wantsLayer = YES;
+    _dropOverlay.layer.cornerRadius = 15;
+    _dropOverlay.layer.backgroundColor = [NSColor.controlAccentColor colorWithAlphaComponent:0.30].CGColor;
+    _dropOverlay.layer.borderWidth = 1.5;
+    _dropOverlay.layer.borderColor = [NSColor.controlAccentColor colorWithAlphaComponent:0.85].CGColor;
+    _dropOverlay.translatesAutoresizingMaskIntoConstraints = NO;
+    _dropOverlay.hidden = YES;
+    _dropOverlay.alphaValue = 0;
+    NSImageView *dropIcon = [[NSImageView alloc] initWithFrame:NSZeroRect];
+    dropIcon.image = [NSImage imageWithSystemSymbolName:@"arrow.down.to.line.compact" accessibilityDescription:@"松开放入"];
+    dropIcon.contentTintColor = NSColor.labelColor;
+    NSTextField *dropLabel = [NSTextField labelWithString:@"松开放入"];
+    dropLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
+    NSStackView *dropMessage = [[NSStackView alloc] initWithFrame:NSZeroRect];
+    dropMessage.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    dropMessage.alignment = NSLayoutAttributeCenterY;
+    dropMessage.spacing = 5;
+    dropMessage.translatesAutoresizingMaskIntoConstraints = NO;
+    [dropMessage addArrangedSubview:dropIcon];
+    [dropMessage addArrangedSubview:dropLabel];
+    [_dropOverlay addSubview:dropMessage];
+    [self addSubview:_dropOverlay positioned:NSWindowAbove relativeTo:nil];
+    [NSLayoutConstraint activateConstraints:@[
+        [_dropOverlay.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:3],
+        [_dropOverlay.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-3],
+        [_dropOverlay.topAnchor constraintEqualToAnchor:self.topAnchor constant:3],
+        [_dropOverlay.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-3],
+        [dropMessage.centerXAnchor constraintEqualToAnchor:_dropOverlay.centerXAnchor],
+        [dropMessage.centerYAnchor constraintEqualToAnchor:_dropOverlay.centerYAnchor]
+    ]];
+    _dropTargetActive = NO;
+    [self reloadContent];
+}
+
+- (NSButton *)iconButton:(NSString *)symbol help:(NSString *)help action:(SEL)action {
+    NSButton *button = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:help]
+                                          target:self action:action];
+    button.bordered = NO;
+    button.toolTip = help;
+    [button.widthAnchor constraintEqualToConstant:17].active = YES;
+    [button.heightAnchor constraintEqualToConstant:17].active = YES;
+    return button;
+}
+
+- (void)reloadContent {
+    NSDictionary *drawer = [_store drawerForID:_drawerID];
+    _nameField.stringValue = drawer[@"name"] ?: @"";
+    NSArray<NSURL *> *items = [_store itemsForDrawerID:_drawerID];
+    _itemURLs = items;
+    NSMutableSet<NSString *> *existingPaths = [NSMutableSet setWithCapacity:items.count];
+    for (NSURL *url in items) [existingPaths addObject:url.path];
+    [_selectedPaths intersectSet:existingPaths];
+    for (NSView *view in _itemStack.arrangedSubviews.copy) {
+        [_itemStack removeArrangedSubview:view];
+        [view removeFromSuperview];
+    }
+    [_visibleTiles removeAllObjects];
+    _pileView = nil;
+    BOOL iconOnTop = SDEdgeIsHorizontal(_edge);
+    __weak typeof(self) weakSelf = self;
+    void (^completion)(void) = ^{ [weakSelf reloadContent]; };
+    void (^moveHandler)(NSURL *, NSURL *) = ^(NSURL *itemURL, NSURL *directoryURL) {
+        SDDrawerContentView *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        NSError *error = nil;
+        if (![strongSelf->_store moveItem:itemURL toDirectory:directoryURL error:&error]) [strongSelf showError:error];
+        [strongSelf reloadContent];
+    };
+    void (^selectionHandler)(NSURL *, BOOL) = ^(NSURL *itemURL, BOOL toggle) {
+        [weakSelf updateSelectionForURL:itemURL toggle:toggle];
+    };
+    NSArray<NSURL *> *(^dragURLsProvider)(NSURL *) = ^NSArray<NSURL *> *(NSURL *itemURL) {
+        return [weakSelf draggingURLsForAnchorURL:itemURL];
+    };
+    BOOL (^selectedProvider)(NSURL *) = ^BOOL(NSURL *itemURL) {
+        return [weakSelf isURLSelected:itemURL];
+    };
+    if (items.count == 0) {
+        NSTextField *empty = [NSTextField labelWithString:@"拖入文件或文件夹"];
+        empty.alignment = NSTextAlignmentCenter;
+        empty.textColor = NSColor.secondaryLabelColor;
+        empty.font = [NSFont systemFontOfSize:10];
+        [_itemStack addArrangedSubview:empty];
+        return;
+    }
+    NSUInteger directCount = items.count > 5 ? 4 : items.count;
+    for (NSUInteger index = 0; index < directCount; index++) {
+        SDFileTileView *tile = [[SDFileTileView alloc] initWithURL:items[index] iconOnTop:iconOnTop
+                                                       completion:completion moveHandler:moveHandler
+                                                  selectionHandler:selectionHandler dragURLsProvider:dragURLsProvider];
+        tile.selected = [_selectedPaths containsObject:items[index].path];
+        [_visibleTiles addObject:tile];
+        [_itemStack addArrangedSubview:tile];
+        [tile.widthAnchor constraintEqualToConstant:iconOnTop ? 72 : 79].active = YES;
+        [tile.heightAnchor constraintEqualToConstant:iconOnTop ? 42 : 46].active = YES;
+    }
+    if (items.count > 5) {
+        NSArray<NSURL *> *stackedItems = [items subarrayWithRange:NSMakeRange(4, items.count - 4)];
+        SDPileView *pile = [[SDPileView alloc] initWithURLs:stackedItems iconOnTop:iconOnTop
+                                                completion:completion moveHandler:moveHandler
+                                           selectionHandler:selectionHandler dragURLsProvider:dragURLsProvider
+                                            selectedProvider:selectedProvider];
+        _pileView = pile;
+        [pile updateSelectionAppearance];
+        [_itemStack addArrangedSubview:pile];
+        [pile.widthAnchor constraintEqualToConstant:iconOnTop ? 72 : 79].active = YES;
+        [pile.heightAnchor constraintEqualToConstant:iconOnTop ? 42 : 46].active = YES;
+    }
+}
+
+- (void)selectAllItems {
+    [_selectedPaths removeAllObjects];
+    for (NSURL *url in _itemURLs) [_selectedPaths addObject:url.path];
+    [self updateSelectionAppearance];
+}
+
+// ai coding: 新建抽屉时可靠进入名称编辑并全选默认名称 2026/09/17: 10:40
+- (void)beginRenaming {
+    if (![self.window makeFirstResponder:_nameField]) return;
+    NSTextView *editor = (NSTextView *)_nameField.currentEditor;
+    if (editor) editor.selectedRange = NSMakeRange(0, _nameField.stringValue.length);
+}
+
+// ai coding: 将当前选中的一个或多个抽屉项目安全移入废纸篓 2026/09/17: 09:51
+- (void)deleteSelectedItems {
+    NSMutableArray<NSURL *> *selectedURLs = [NSMutableArray array];
+    for (NSURL *url in _itemURLs) {
+        if ([_selectedPaths containsObject:url.path]) [selectedURLs addObject:url];
+    }
+    if (selectedURLs.count == 0) {
+        NSBeep();
+        return;
+    }
+    [NSWorkspace.sharedWorkspace recycleURLs:selectedURLs
+                            completionHandler:^(NSDictionary<NSURL *, NSURL *> *newURLs __unused, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (error) [self showError:error];
+            [self reloadContent];
+        });
+    }];
+}
+
+- (void)updateSelectionForURL:(NSURL *)url toggle:(BOOL)toggle {
+    if (!url.path) return;
+    if (toggle) {
+        if ([_selectedPaths containsObject:url.path]) [_selectedPaths removeObject:url.path];
+        else [_selectedPaths addObject:url.path];
+    } else {
+        [_selectedPaths removeAllObjects];
+        [_selectedPaths addObject:url.path];
+    }
+    [self updateSelectionAppearance];
+}
+
+- (NSArray<NSURL *> *)draggingURLsForAnchorURL:(NSURL *)anchorURL {
+    if (![_selectedPaths containsObject:anchorURL.path]) return anchorURL ? @[anchorURL] : @[];
+    NSMutableArray<NSURL *> *selectedURLs = [NSMutableArray arrayWithCapacity:_selectedPaths.count];
+    for (NSURL *url in _itemURLs) {
+        if ([_selectedPaths containsObject:url.path]) [selectedURLs addObject:url];
+    }
+    return selectedURLs;
+}
+
+- (BOOL)isURLSelected:(NSURL *)url {
+    return url.path && [_selectedPaths containsObject:url.path];
+}
+
+- (void)updateSelectionAppearance {
+    for (SDFileTileView *tile in _visibleTiles) {
+        tile.selected = [self isURLSelected:tile.url];
+    }
+    [_pileView updateSelectionAppearance];
+}
+
+- (void)controlTextDidEndEditing:(NSNotification *)notification {
+    NSError *error = nil;
+    if (![_store renameDrawerID:_drawerID name:_nameField.stringValue error:&error]) [self showError:error];
+    [self reloadContent];
+    // ai coding: 名称编辑结束后把焦点移回抽屉本体，清除持续显示的选中和光标状态 2026/09/17: 10:33
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.window.firstResponder != self) [self.window makeFirstResponder:self];
+    });
+}
+
+// ai coding: 拖入素材悬停时显示脉冲落点提示，离开或完成后平滑收起 2026/09/17: 08:40
+- (void)setDropTargetActive:(BOOL)active {
+    if (_dropTargetActive == active || !_dropOverlay) return;
+    _dropTargetActive = active;
+    if (active) {
+        _dropOverlay.hidden = NO;
+        CABasicAnimation *pulse = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+        pulse.fromValue = @0.97;
+        pulse.toValue = @1.0;
+        pulse.duration = 0.48;
+        pulse.autoreverses = YES;
+        pulse.repeatCount = HUGE_VALF;
+        [_dropOverlay.layer addAnimation:pulse forKey:@"dropPulse"];
+        [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+            context.duration = 0.16;
+            self->_dropOverlay.animator.alphaValue = 1;
+        } completionHandler:nil];
+    } else {
+        [_dropOverlay.layer removeAnimationForKey:@"dropPulse"];
+        [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+            context.duration = 0.14;
+            self->_dropOverlay.animator.alphaValue = 0;
+        } completionHandler:^{
+            if (!self->_dropTargetActive) self->_dropOverlay.hidden = YES;
+        }];
+    }
+}
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    NSArray<NSURL *> *urls = [sender.draggingPasteboard readObjectsForClasses:@[NSURL.class]
+                                                                      options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+    if (urls.count == 0) return NSDragOperationNone;
+    [self setDropTargetActive:YES];
+    return NSDragOperationMove;
+}
+
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender { return NSDragOperationMove; }
+
+- (void)draggingExited:(id<NSDraggingInfo>)sender { [self setDropTargetActive:NO]; }
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    NSArray<NSURL *> *urls = [sender.draggingPasteboard readObjectsForClasses:@[NSURL.class]
+                                                                      options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+    [self setDropTargetActive:NO];
+    if (urls.count == 0) return NO;
+    NSError *error = nil;
+    if (![_store importURLs:urls drawerID:_drawerID error:&error]) [self showError:error];
+    [self reloadContent];
+    return error == nil;
+}
+
+- (void)concludeDragOperation:(id<NSDraggingInfo>)sender { [self setDropTargetActive:NO]; }
+
+- (void)chooseItems:(id)sender {
+    NSOpenPanel *panel = NSOpenPanel.openPanel;
+    panel.title = @"选择要移入抽屉的文件或目录";
+    panel.prompt = @"移入抽屉";
+    panel.canChooseFiles = YES;
+    panel.canChooseDirectories = YES;
+    panel.allowsMultipleSelection = YES;
+    panel.resolvesAliases = YES;
+    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
+        if (response != NSModalResponseOK) return;
+        NSError *error = nil;
+        if (![self->_store importURLs:panel.URLs drawerID:self->_drawerID error:&error]) [self showError:error];
+        [self reloadContent];
+    }];
+}
+
+// ai coding: 按文件、图片、Markdown、普通文本优先级读取剪贴板并立即导入当前收纳盒 2026/09/17: 14:10
+- (BOOL)pasteFromPasteboard {
+    NSPasteboard *pasteboard = NSPasteboard.generalPasteboard;
+    NSArray<NSURL *> *fileURLs = [pasteboard readObjectsForClasses:@[NSURL.class]
+                                                           options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+    NSError *error = nil;
+    if (fileURLs.count > 0) {
+        if (![_store importURLs:fileURLs drawerID:_drawerID error:&error]) {
+            [self showError:error];
+            return NO;
+        }
+        [self reloadContent];
+        return YES;
+    }
+
+    if ([pasteboard dataForType:NSPasteboardTypePNG] || [pasteboard dataForType:NSPasteboardTypeTIFF] ||
+        [[NSImage alloc] initWithPasteboard:pasteboard]) {
+        NSURL *imageURL = SDWritePastedImage(pasteboard, &error);
+        if (!imageURL || ![_store importURLs:@[imageURL] drawerID:_drawerID error:&error]) {
+            if (imageURL) [NSFileManager.defaultManager removeItemAtURL:imageURL error:nil];
+            [self showError:error ?: SDError(11, @"剪贴板中的图片无法读取。")];
+            return NO;
+        }
+        [self reloadContent];
+        return YES;
+    }
+
+    NSString *text = [pasteboard stringForType:NSPasteboardTypeString];
+    if (text.length == 0) {
+        NSData *rtfData = [pasteboard dataForType:NSPasteboardTypeRTF];
+        if (rtfData.length > 0) {
+            NSAttributedString *attributed = [[NSAttributedString alloc] initWithRTF:rtfData
+                                                                    documentAttributes:nil];
+            text = attributed.string;
+        }
+    }
+    if (text.length == 0) {
+        NSData *htmlData = [pasteboard dataForType:NSPasteboardTypeHTML];
+        if (htmlData.length > 0) {
+            NSAttributedString *attributed = [[NSAttributedString alloc] initWithHTML:htmlData
+                                                                      documentAttributes:nil];
+            text = attributed.string;
+        }
+    }
+    if (text.length == 0) {
+        NSBeep();
+        return NO;
+    }
+    NSURL *textURL = SDWritePastedText(text, SDStringLooksLikeMarkdown(text), &error);
+    if (!textURL || ![_store importURLs:@[textURL] drawerID:_drawerID error:&error]) {
+        if (textURL) [NSFileManager.defaultManager removeItemAtURL:textURL error:nil];
+        [self showError:error ?: SDError(12, @"剪贴板中的文本无法保存。")];
+        return NO;
+    }
+    [self reloadContent];
+    return YES;
+}
+
+- (void)createDrawer:(id)sender { if (self.newDrawerHandler) self.newDrawerHandler(); }
+
+- (void)toggleLocked:(id)sender {
+    _locked = !_locked;
+    [_store updateDrawerID:_drawerID locked:_locked];
+    // ai coding: 切换固定状态时继续使用 -45° 旋转图钉 2026/09/17: 09:19
+    _lockButton.image = SDRotatedPinSymbol(_locked);
+    _lockButton.toolTip = _locked ? @"取消固定" : @"固定抽屉";
+    _lockButton.contentTintColor = _locked ? NSColor.controlAccentColor : NSColor.secondaryLabelColor;
+    if (self.lockHandler) self.lockHandler(_locked);
+}
+
+- (void)exportDrawer:(id)sender {
+    NSOpenPanel *panel = NSOpenPanel.openPanel;
+    panel.title = @"选择保存抽屉文件夹的位置";
+    panel.prompt = @"保存到这里";
+    panel.canChooseFiles = NO;
+    panel.canChooseDirectories = YES;
+    panel.canCreateDirectories = YES;
+    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
+        if (response != NSModalResponseOK) return;
+        NSError *error = nil;
+        NSURL *folder = [self->_store saveDrawerID:self->_drawerID inDirectory:panel.URL error:&error];
+        if (!folder) [self showError:error];
+        else [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[folder]];
+        [self reloadContent];
+    }];
+}
+
+- (void)saveDrawerAsFolder {
+    [self.window makeFirstResponder:nil];
+    [self exportDrawer:nil];
+}
+
+- (void)deleteDrawer:(id)sender { if (self.deleteHandler) self.deleteHandler(_drawerID); }
+
+- (void)showError:(NSError *)error {
+    if (!error) return;
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"操作没有完成";
+    alert.informativeText = error.localizedDescription;
+    [alert addButtonWithTitle:@"好"];
+    [alert beginSheetModalForWindow:self.window completionHandler:nil];
+}
+@end
+
+// ai coding: 为激活的抽屉统一处理新建、全选、保存、删除和粘贴快捷键 2026/09/17: 14:10
+@interface SDDrawerPanel : NSPanel
+@property(nonatomic, copy) void (^selectAllHandler)(void);
+@property(nonatomic, copy) void (^createDrawerHandler)(void);
+@property(nonatomic, copy) void (^saveDrawerHandler)(void);
+@property(nonatomic, copy) void (^deleteSelectedHandler)(void);
+// ai coding: 为 Command+V 提供当前收纳盒剪贴板导入回调 2026/09/17: 14:10
+@property(nonatomic, copy) void (^pasteHandler)(void);
+@end
+@implementation SDDrawerPanel
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return NO; }
+
+- (BOOL)isEditingDrawerName {
+    return [self.firstResponder isKindOfClass:NSTextView.class] &&
+        [(NSTextView *)self.firstResponder isFieldEditor];
+}
+
+- (BOOL)handleDrawerShortcutEvent:(NSEvent *)event {
+    if (event.type != NSEventTypeKeyDown) return NO;
+    NSEventModifierFlags relevantFlags = event.modifierFlags &
+        (NSEventModifierFlagCommand | NSEventModifierFlagShift |
+         NSEventModifierFlagControl | NSEventModifierFlagOption);
+    NSString *key = event.charactersIgnoringModifiers.lowercaseString;
+    if (relevantFlags == NSEventModifierFlagCommand) {
+        if ([key isEqualToString:@"a"] && self.selectAllHandler) {
+            self.selectAllHandler();
+            return YES;
+        }
+        if ([key isEqualToString:@"n"] && self.createDrawerHandler) {
+            self.createDrawerHandler();
+            return YES;
+        }
+        if ([key isEqualToString:@"s"] && self.saveDrawerHandler) {
+            self.saveDrawerHandler();
+            return YES;
+        }
+        // ai coding: 抽屉激活时拦截 Command+V，将文件或内容直接粘贴为收纳盒项目 2026/09/17: 14:10
+        if ([key isEqualToString:@"v"] && ![self isEditingDrawerName] && self.pasteHandler) {
+            self.pasteHandler();
+            return YES;
+        }
+    }
+    BOOL isDelete = relevantFlags == 0 && (event.keyCode == 51 || event.keyCode == 117);
+    if (isDelete && ![self isEditingDrawerName] && self.deleteSelectedHandler) {
+        self.deleteSelectedHandler();
+        return YES;
+    }
+    return NO;
+}
+
+- (BOOL)performKeyEquivalent:(NSEvent *)event {
+    if ([self handleDrawerShortcutEvent:event]) return YES;
+    return [super performKeyEquivalent:event];
+}
+
+- (void)keyDown:(NSEvent *)event {
+    if ([self handleDrawerShortcutEvent:event]) return;
+    [super keyDown:event];
+}
+@end
+
+@interface SDDrawerPanelController : NSObject <NSWindowDelegate>
+@property(nonatomic, readonly) NSString *drawerID;
+@property(nonatomic, readonly) SDDrawerPanel *panel;
+@property(nonatomic, copy) void (^deleteHandler)(NSString *drawerID);
+@property(nonatomic, copy) void (^newDrawerHandler)(void);
+// ai coding: 暴露抽屉激活状态和菜单操作接口 2026/09/17: 10:47
+@property(nonatomic, copy) void (^activationHandler)(NSString *drawerID);
+- (instancetype)initWithStore:(SDDrawerStore *)store drawerID:(NSString *)drawerID;
+- (void)show;
+- (void)reloadContent;
+- (void)beginRenaming;
+- (void)selectAllItems;
+- (void)saveDrawerAsFolder;
+- (void)deleteSelectedItems;
+// ai coding: 暴露粘贴和菜单尺寸调整接口给应用菜单 2026/09/17: 14:10
+- (BOOL)pasteFromPasteboard;
+- (CGFloat)currentDrawerThickness;
+- (void)setDrawerThickness:(CGFloat)thickness;
+- (BOOL)isEditingDrawerName;
+@end
+
+@implementation SDDrawerPanelController {
+    SDDrawerStore *_store;
+    SDDrawerContentView *_contentView;
+    NSString *_edge;
+    BOOL _adjustingFrame;
+}
+
+// ai coding: 按方向读取长边长度和菜单设置的上下高度或左右宽度 2026/09/17: 14:10
+- (instancetype)initWithStore:(SDDrawerStore *)store drawerID:(NSString *)drawerID {
+    self = [super init];
+    if (!self) return nil;
+    _store = store;
+    _drawerID = [drawerID copy];
+    NSDictionary *drawer = [store drawerForID:drawerID];
+    _edge = [drawer[@"edge"] ?: SDEdgeRight copy];
+    NSSize size = [self sizeForEdge:_edge];
+    _panel = [[SDDrawerPanel alloc] initWithContentRect:NSMakeRect(0, 0, size.width, size.height)
+                                              styleMask:NSWindowStyleMaskBorderless
+                                                backing:NSBackingStoreBuffered defer:NO];
+    _panel.delegate = self;
+    _panel.opaque = NO;
+    _panel.backgroundColor = NSColor.clearColor;
+    _panel.hasShadow = YES;
+    _panel.level = NSStatusWindowLevel;
+    _panel.hidesOnDeactivate = NO;
+    BOOL locked = [drawer[@"locked"] boolValue];
+    _panel.movable = !locked;
+    _panel.movableByWindowBackground = !locked;
+    // ai coding: 允许点击无标题抽屉后稳定成为按键目标窗口 2026/09/17: 09:51
+    _panel.becomesKeyOnlyIfNeeded = NO;
+    _panel.animationBehavior = NSWindowAnimationBehaviorUtilityWindow;
+    _panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                NSWindowCollectionBehaviorFullScreenAuxiliary |
+                                NSWindowCollectionBehaviorStationary;
+    _contentView = [[SDDrawerContentView alloc] initWithStore:store drawerID:drawerID edge:_edge];
+    __weak typeof(self) weakSelf = self;
+    _contentView.deleteHandler = ^(NSString *identifier) {
+        if (weakSelf.deleteHandler) weakSelf.deleteHandler(identifier);
+    };
+    _contentView.newDrawerHandler = ^{ if (weakSelf.newDrawerHandler) weakSelf.newDrawerHandler(); };
+    _contentView.lockHandler = ^(BOOL lockedState) { [weakSelf setLocked:lockedState]; };
+    // ai coding: 将抽屉窗口快捷键连接到新建、全选、保存和删除所选项目操作 2026/09/17: 09:51
+    _panel.selectAllHandler = ^{
+        SDDrawerPanelController *strongSelf = weakSelf;
+        [strongSelf->_contentView selectAllItems];
+    };
+    _panel.createDrawerHandler = ^{
+        SDDrawerPanelController *strongSelf = weakSelf;
+        if (strongSelf.newDrawerHandler) strongSelf.newDrawerHandler();
+    };
+    _panel.saveDrawerHandler = ^{
+        SDDrawerPanelController *strongSelf = weakSelf;
+        [strongSelf->_contentView saveDrawerAsFolder];
+    };
+    _panel.deleteSelectedHandler = ^{
+        SDDrawerPanelController *strongSelf = weakSelf;
+        [strongSelf->_contentView deleteSelectedItems];
+    };
+    // ai coding: 将 Command+V 路由到当前抽屉内容视图的剪贴板导入逻辑 2026/09/17: 14:10
+    _panel.pasteHandler = ^{
+        SDDrawerPanelController *strongSelf = weakSelf;
+        [strongSelf->_contentView pasteFromPasteboard];
+    };
+    // ai coding: 普通显示时把默认键盘焦点放在抽屉本体而不是名称输入框 2026/09/17: 10:33
+    _panel.contentView = _contentView;
+    _panel.initialFirstResponder = _contentView;
+    [_panel makeFirstResponder:_contentView];
+    return self;
+}
+
+- (void)setLocked:(BOOL)locked {
+    _panel.movable = !locked;
+    _panel.movableByWindowBackground = !locked;
+}
+
+- (void)show {
+    NSDictionary *drawer = [_store drawerForID:_drawerID];
+    CGFloat position = [drawer[@"position"] doubleValue];
+    NSScreen *screen = NSScreen.mainScreen;
+    if (screen) [_panel setFrame:[self frameForEdge:_edge position:position screen:screen] display:NO];
+    [_contentView reloadContent];
+    [_panel orderFrontRegardless];
+}
+
+- (void)reloadContent {
+    [_contentView reloadContent];
+}
+
+// ai coding: 暴露当前抽屉的菜单操作并报告键盘焦点状态 2026/09/17: 10:47
+- (void)selectAllItems { [_contentView selectAllItems]; }
+- (void)saveDrawerAsFolder { [_contentView saveDrawerAsFolder]; }
+- (void)deleteSelectedItems { [_contentView deleteSelectedItems]; }
+// ai coding: 将菜单和 Command+V 的粘贴操作转发给当前抽屉内容视图 2026/09/17: 14:10
+- (BOOL)pasteFromPasteboard { return [_contentView pasteFromPasteboard]; }
+
+// ai coding: 提供当前抽屉厚度读写，菜单根据吸附方向映射为高度或宽度 2026/09/17: 14:10
+- (CGFloat)currentDrawerThickness {
+    NSDictionary *drawer = [_store drawerForID:_drawerID];
+    return SDEdgeIsHorizontal(_edge)
+        ? [drawer[@"horizontalThickness"] doubleValue]
+        : [drawer[@"verticalThickness"] doubleValue];
+}
+
+- (void)setDrawerThickness:(CGFloat)thickness {
+    NSScreen *screen = _panel.screen ?: NSScreen.mainScreen;
+    if (!screen) return;
+    NSRect visible = screen.visibleFrame;
+    if ([_edge isEqualToString:SDEdgeBottom]) {
+        NSRect fullFrame = screen.frame;
+        visible.origin.y = NSMinY(fullFrame);
+        visible.size.height = NSMaxY(fullFrame) - NSMinY(fullFrame);
+    }
+    CGFloat maximum = SDEdgeIsHorizontal(_edge) ? visible.size.height : visible.size.width;
+    CGFloat minimum = SDEdgeIsHorizontal(_edge) ? SDHorizontalMinimumThickness : SDVerticalMinimumThickness;
+    CGFloat clamped = MAX(minimum, MIN(maximum, thickness));
+    [_store updateDrawerID:_drawerID thickness:clamped forEdge:_edge];
+    NSDictionary *drawer = [_store drawerForID:_drawerID];
+    CGFloat position = [drawer[@"position"] doubleValue];
+    _adjustingFrame = YES;
+    [_panel setFrame:[self frameForEdge:_edge position:position screen:screen] display:YES animate:YES];
+    _adjustingFrame = NO;
+}
+- (BOOL)isEditingDrawerName { return [_panel isEditingDrawerName]; }
+
+- (void)beginRenaming {
+    [NSApp activateIgnoringOtherApps:YES];
+    [_panel orderFrontRegardless];
+    // ai coding: 等待新窗口完成激活后再聚焦名称，避免默认响应者覆盖输入焦点 2026/09/17: 10:40
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self->_panel makeKeyWindow];
+        [self->_contentView beginRenaming];
+    });
+}
+
+- (void)windowDidMove:(NSNotification *)notification {
+    if (_adjustingFrame) return;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(snapToNearestEdge) object:nil];
+    [self performSelector:@selector(snapToNearestEdge) withObject:nil afterDelay:0.22];
+}
+
+// ai coding: 抽屉成为当前窗口时记录其标识供菜单命令使用 2026/09/17: 10:47
+- (void)windowDidBecomeKey:(NSNotification *)notification {
+    if (self.activationHandler) self.activationHandler(_drawerID);
+}
+
+- (void)windowDidResize:(NSNotification *)notification {
+    if (_adjustingFrame) return;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(persistResizedFrame) object:nil];
+    [self performSelector:@selector(persistResizedFrame) withObject:nil afterDelay:0.18];
+}
+
+- (void)persistResizedFrame {
+    NSScreen *screen = _panel.screen ?: NSScreen.mainScreen;
+    if (!screen) return;
+    NSRect frame = _panel.frame;
+    CGFloat length = SDEdgeIsHorizontal(_edge) ? frame.size.width : frame.size.height;
+    [_store updateDrawerID:_drawerID length:length forEdge:_edge];
+    NSRect visible = screen.visibleFrame;
+    CGFloat available = SDEdgeIsHorizontal(_edge)
+        ? MAX(1, visible.size.width - frame.size.width)
+        : MAX(1, visible.size.height - frame.size.height);
+    CGFloat offset = SDEdgeIsHorizontal(_edge)
+        ? NSMinX(frame) - NSMinX(visible)
+        : NSMinY(frame) - NSMinY(visible);
+    [_store updateDrawerID:_drawerID edge:_edge position:MAX(0, MIN(1, offset / available))];
+}
+
+- (void)snapToNearestEdge {
+    NSScreen *screen = _panel.screen ?: NSScreen.mainScreen;
+    if (!screen) return;
+    NSRect visible = screen.visibleFrame;
+    NSRect fullFrame = screen.frame;
+    NSRect frame = _panel.frame;
+    NSDictionary<NSString *, NSNumber *> *distances = @{
+        SDEdgeLeft: @(fabs(NSMinX(frame) - NSMinX(visible))),
+        SDEdgeRight: @(fabs(NSMaxX(visible) - NSMaxX(frame))),
+        SDEdgeBottom: @(fabs(NSMinY(frame) - NSMinY(fullFrame))),
+        SDEdgeTop: @(fabs(NSMaxY(visible) - NSMaxY(frame)))
+    };
+    NSString *nearest = SDEdgeLeft;
+    for (NSString *candidate in distances) {
+        if (distances[candidate].doubleValue < distances[nearest].doubleValue) nearest = candidate;
+    }
+    NSSize nextSize = [self sizeForEdge:nearest];
+    CGFloat position;
+    if (SDEdgeIsHorizontal(nearest)) {
+        CGFloat available = MAX(1, visible.size.width - nextSize.width);
+        position = (NSMidX(frame) - NSMinX(visible) - nextSize.width / 2) / available;
+    } else {
+        CGFloat available = MAX(1, visible.size.height - nextSize.height);
+        position = (NSMidY(frame) - NSMinY(visible) - nextSize.height / 2) / available;
+    }
+    position = MAX(0, MIN(1, position));
+    _edge = nearest;
+    [_contentView setDrawerEdge:nearest];
+    [_store updateDrawerID:_drawerID edge:nearest position:position];
+    _adjustingFrame = YES;
+    [_panel setFrame:[self frameForEdge:nearest position:position screen:screen] display:YES animate:YES];
+    _adjustingFrame = NO;
+}
+
+- (NSSize)sizeForEdge:(NSString *)edge {
+    NSDictionary *drawer = [_store drawerForID:_drawerID];
+    if (SDEdgeIsHorizontal(edge)) {
+        CGFloat length = MAX(SDHorizontalMinimumLength, [drawer[@"horizontalLength"] doubleValue]);
+        CGFloat thickness = MAX(SDHorizontalMinimumThickness, [drawer[@"horizontalThickness"] doubleValue]);
+        return NSMakeSize(length, thickness);
+    }
+    CGFloat length = MAX(SDVerticalMinimumLength, [drawer[@"verticalLength"] doubleValue]);
+    CGFloat thickness = MAX(SDVerticalMinimumThickness, [drawer[@"verticalThickness"] doubleValue]);
+    return NSMakeSize(thickness, length);
+}
+
+// ai coding: 将四向吸附间距改为零并允许底部抽屉落到 Dock 所在的屏幕底边 2026/09/17: 13:41
+- (NSRect)frameForEdge:(NSString *)edge position:(CGFloat)position screen:(NSScreen *)screen {
+    NSRect visible = screen.visibleFrame;
+    if ([edge isEqualToString:SDEdgeBottom]) {
+        NSRect fullFrame = screen.frame;
+        visible.origin.y = NSMinY(fullFrame);
+        visible.size.height = NSMaxY(fullFrame) - NSMinY(fullFrame);
+    }
+    NSSize size = [self sizeForEdge:edge];
+    CGFloat inset = 0;
+    if (SDEdgeIsHorizontal(edge)) size.width = MIN(size.width, MAX(SDHorizontalMinimumLength, visible.size.width - inset * 2));
+    else size.height = MIN(size.height, MAX(SDVerticalMinimumLength, visible.size.height - inset * 2));
+    // ai coding: 限制菜单输入的抽屉高度或宽度不超过当前屏幕可用范围 2026/09/17: 14:10
+    if (SDEdgeIsHorizontal(edge)) size.height = MIN(size.height, MAX(SDHorizontalMinimumThickness, visible.size.height));
+    else size.width = MIN(size.width, MAX(SDVerticalMinimumThickness, visible.size.width));
+    NSRect frame = NSMakeRect(0, 0, size.width, size.height);
+    if ([edge isEqualToString:SDEdgeLeft]) {
+        frame.origin.x = NSMinX(visible) + inset;
+        frame.origin.y = NSMinY(visible) + position * MAX(0, visible.size.height - size.height);
+    } else if ([edge isEqualToString:SDEdgeRight]) {
+        frame.origin.x = NSMaxX(visible) - size.width - inset;
+        frame.origin.y = NSMinY(visible) + position * MAX(0, visible.size.height - size.height);
+    } else if ([edge isEqualToString:SDEdgeTop]) {
+        frame.origin.x = NSMinX(visible) + position * MAX(0, visible.size.width - size.width);
+        frame.origin.y = NSMaxY(visible) - size.height - inset;
+    } else {
+        frame.origin.x = NSMinX(visible) + position * MAX(0, visible.size.width - size.width);
+        frame.origin.y = NSMinY(visible) + inset;
+    }
+    return frame;
+}
+@end
+
+// ai coding: 增加可录制任意组合键的原生快捷键输入控件 2026/09/17: 09:19
+static NSString * const SDShortcutKeyCodeDefaultsKey = @"MoveShortcutKeyCode";
+static NSString * const SDShortcutModifiersDefaultsKey = @"MoveShortcutModifiers";
+static NSString * const SDShortcutKeyNameDefaultsKey = @"MoveShortcutKeyName";
+
+static CGEventFlags SDShortcutModifiersFromEvent(NSEventModifierFlags flags) {
+    CGEventFlags result = 0;
+    if (flags & NSEventModifierFlagCommand) result |= kCGEventFlagMaskCommand;
+    if (flags & NSEventModifierFlagOption) result |= kCGEventFlagMaskAlternate;
+    if (flags & NSEventModifierFlagControl) result |= kCGEventFlagMaskControl;
+    if (flags & NSEventModifierFlagShift) result |= kCGEventFlagMaskShift;
+    return result;
+}
+
+static NSString *SDShortcutKeyName(NSEvent *event) {
+    switch (event.keyCode) {
+        case 36: return @"↩";
+        case 48: return @"⇥";
+        case 49: return @"空格";
+        case 51: return @"⌫";
+        case 53: return @"⎋";
+        case 123: return @"←";
+        case 124: return @"→";
+        case 125: return @"↓";
+        case 126: return @"↑";
+        default: break;
+    }
+    NSString *characters = event.charactersIgnoringModifiers.uppercaseString;
+    return characters.length > 0 ? characters : @"";
+}
+
+static NSString *SDShortcutDisplayString(CGEventFlags modifiers, NSString *keyName) {
+    NSMutableString *display = [NSMutableString string];
+    if (modifiers & kCGEventFlagMaskControl) [display appendString:@"⌃"];
+    if (modifiers & kCGEventFlagMaskAlternate) [display appendString:@"⌥"];
+    if (modifiers & kCGEventFlagMaskShift) [display appendString:@"⇧"];
+    if (modifiers & kCGEventFlagMaskCommand) [display appendString:@"⌘"];
+    [display appendString:keyName ?: @""];
+    return display;
+}
+
+@interface SDShortcutRecorderView : NSView
+@property(nonatomic, readonly) CGKeyCode recordedKeyCode;
+@property(nonatomic, readonly) CGEventFlags recordedModifiers;
+@property(nonatomic, readonly) NSString *recordedKeyName;
+@property(nonatomic, readonly) BOOL hasValidShortcut;
+- (instancetype)initWithKeyCode:(CGKeyCode)keyCode modifiers:(CGEventFlags)modifiers keyName:(NSString *)keyName;
+@end
+
+@implementation SDShortcutRecorderView {
+    NSTextField *_label;
+    CGKeyCode _recordedKeyCode;
+    CGEventFlags _recordedModifiers;
+    NSString *_recordedKeyName;
+    BOOL _hasValidShortcut;
+}
+
+- (instancetype)initWithKeyCode:(CGKeyCode)keyCode modifiers:(CGEventFlags)modifiers keyName:(NSString *)keyName {
+    self = [super initWithFrame:NSMakeRect(0, 0, 280, 44)];
+    if (!self) return nil;
+    _recordedKeyCode = keyCode;
+    _recordedModifiers = modifiers;
+    _recordedKeyName = [keyName copy];
+    _hasValidShortcut = keyName.length > 0;
+    self.wantsLayer = YES;
+    self.layer.cornerRadius = 9;
+    self.layer.borderWidth = 1;
+    self.layer.borderColor = [NSColor.separatorColor colorWithAlphaComponent:0.8].CGColor;
+    self.layer.backgroundColor = [NSColor.controlBackgroundColor colorWithAlphaComponent:0.55].CGColor;
+    _label = [NSTextField labelWithString:SDShortcutDisplayString(modifiers, keyName)];
+    _label.font = [NSFont monospacedSystemFontOfSize:17 weight:NSFontWeightSemibold];
+    _label.alignment = NSTextAlignmentCenter;
+    _label.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:_label];
+    [NSLayoutConstraint activateConstraints:@[
+        [_label.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+        [_label.centerYAnchor constraintEqualToAnchor:self.centerYAnchor]
+    ]];
+    return self;
+}
+
+- (CGKeyCode)recordedKeyCode { return _recordedKeyCode; }
+- (CGEventFlags)recordedModifiers { return _recordedModifiers; }
+- (NSString *)recordedKeyName { return _recordedKeyName; }
+- (BOOL)hasValidShortcut { return _hasValidShortcut; }
+- (BOOL)acceptsFirstResponder { return YES; }
+- (BOOL)mouseDownCanMoveWindow { return NO; }
+
+- (BOOL)becomeFirstResponder {
+    self.layer.borderColor = NSColor.controlAccentColor.CGColor;
+    return YES;
+}
+
+- (BOOL)resignFirstResponder {
+    self.layer.borderColor = [NSColor.separatorColor colorWithAlphaComponent:0.8].CGColor;
+    return YES;
+}
+
+- (void)mouseDown:(NSEvent *)event { [self.window makeFirstResponder:self]; }
+- (void)keyDown:(NSEvent *)event { [self recordEvent:event]; }
+- (BOOL)performKeyEquivalent:(NSEvent *)event { return [self recordEvent:event]; }
+
+- (BOOL)recordEvent:(NSEvent *)event {
+    CGEventFlags modifiers = SDShortcutModifiersFromEvent(event.modifierFlags);
+    CGEventFlags primaryModifiers = modifiers &
+        (kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate | kCGEventFlagMaskControl);
+    NSString *keyName = SDShortcutKeyName(event);
+    if (primaryModifiers == 0 || keyName.length == 0) {
+        NSBeep();
+        _label.stringValue = @"请包含 ⌘、⌥ 或 ⌃";
+        _hasValidShortcut = NO;
+        return YES;
+    }
+    _recordedKeyCode = event.keyCode;
+    _recordedModifiers = modifiers;
+    _recordedKeyName = [keyName copy];
+    _hasValidShortcut = YES;
+    _label.stringValue = SDShortcutDisplayString(modifiers, keyName);
+    return YES;
+}
+@end
+
+// ai coding: 增加仅显示名称和右侧快捷键的收纳盒选项按钮 2026/09/17: 11:23
+@interface SDDrawerChoiceButton : NSButton
+@property(nonatomic, readonly) NSTextField *nameLabel;
+@property(nonatomic, readonly) NSTextField *shortcutLabel;
+- (instancetype)initWithName:(NSString *)name shortcut:(NSString *)shortcut;
+- (void)setKeyboardSelected:(BOOL)selected;
+@end
+
+@implementation SDDrawerChoiceButton
+- (instancetype)initWithName:(NSString *)name shortcut:(NSString *)shortcut {
+    self = [super initWithFrame:NSZeroRect];
+    if (!self) return nil;
+    self.title = @"";
+    self.bordered = YES;
+    self.bezelStyle = NSBezelStyleRounded;
+    self.buttonType = NSButtonTypePushOnPushOff;
+    self.refusesFirstResponder = YES;
+    _nameLabel = [NSTextField labelWithString:name];
+    _nameLabel.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
+    _nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    _nameLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _shortcutLabel = [NSTextField labelWithString:shortcut];
+    _shortcutLabel.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    _shortcutLabel.alignment = NSTextAlignmentRight;
+    _shortcutLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [_nameLabel setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                         forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [_shortcutLabel setContentCompressionResistancePriority:NSLayoutPriorityRequired
+                                             forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self addSubview:_nameLabel];
+    [self addSubview:_shortcutLabel];
+    [NSLayoutConstraint activateConstraints:@[
+        [_nameLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:9],
+        [_nameLabel.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [_nameLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_shortcutLabel.leadingAnchor constant:-5],
+        [_shortcutLabel.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-8],
+        [_shortcutLabel.centerYAnchor constraintEqualToAnchor:self.centerYAnchor]
+    ]];
+    [self setKeyboardSelected:NO];
+    return self;
+}
+
+- (NSView *)hitTest:(NSPoint)point {
+    return NSPointInRect(point, self.bounds) ? self : nil;
+}
+
+- (void)setKeyboardSelected:(BOOL)selected {
+    self.state = selected ? NSControlStateValueOn : NSControlStateValueOff;
+    _nameLabel.textColor = selected ? NSColor.alternateSelectedControlTextColor : NSColor.labelColor;
+    _shortcutLabel.textColor = selected ? NSColor.alternateSelectedControlTextColor : NSColor.secondaryLabelColor;
+}
+@end
+
+// ai coding: 让选择面板支持上下键高亮、回车确认及数字组合键直达 2026/09/17: 11:23
+@interface SDDrawerChoicePanel : NSPanel
+@property(nonatomic, copy) void (^selectionHandler)(NSInteger index);
+@property(nonatomic, copy) NSArray<SDDrawerChoiceButton *> *choiceButtons;
+@property(nonatomic) NSInteger selectedIndex;
+@end
+
+@implementation SDDrawerChoicePanel
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return NO; }
+
+- (void)setSelectedIndex:(NSInteger)selectedIndex {
+    if (self.choiceButtons.count == 0) {
+        _selectedIndex = NSNotFound;
+        return;
+    }
+    _selectedIndex = MAX(0, MIN(selectedIndex, (NSInteger)self.choiceButtons.count - 1));
+    [self.choiceButtons enumerateObjectsUsingBlock:^(SDDrawerChoiceButton *button, NSUInteger index, BOOL *stop __unused) {
+        [button setKeyboardSelected:index == (NSUInteger)self->_selectedIndex];
+    }];
+    SDDrawerChoiceButton *selectedButton = self.choiceButtons[(NSUInteger)_selectedIndex];
+    [selectedButton scrollRectToVisible:selectedButton.bounds];
+}
+
+- (BOOL)handleChoiceShortcut:(NSEvent *)event {
+    if (event.type != NSEventTypeKeyDown) return NO;
+    NSEventModifierFlags modifiers = event.modifierFlags &
+        (NSEventModifierFlagCommand | NSEventModifierFlagOption |
+         NSEventModifierFlagControl | NSEventModifierFlagShift);
+    NSString *characters = event.charactersIgnoringModifiers;
+    if (modifiers == NSEventModifierFlagOption || modifiers == NSEventModifierFlagCommand) {
+        if (characters.length != 1) return NO;
+        unichar character = [characters characterAtIndex:0];
+        if (character < '1' || character > '9') return NO;
+        NSInteger index = character - '1';
+        if (index >= (NSInteger)self.choiceButtons.count) {
+            NSBeep();
+            return YES;
+        }
+        self.selectedIndex = index;
+        if (self.selectionHandler) self.selectionHandler(index);
+        return YES;
+    }
+    if (modifiers != 0) return NO;
+    if (event.keyCode == 126) {
+        self.selectedIndex -= 1;
+        return YES;
+    }
+    if (event.keyCode == 125) {
+        self.selectedIndex += 1;
+        return YES;
+    }
+    if (event.keyCode == 36 || event.keyCode == 76 || [characters isEqualToString:@"\r"]) {
+        if (_selectedIndex != NSNotFound && self.selectionHandler) self.selectionHandler(_selectedIndex);
+        return YES;
+    }
+    return NO;
+}
+
+- (BOOL)performKeyEquivalent:(NSEvent *)event {
+    if ([self handleChoiceShortcut:event]) return YES;
+    return [super performKeyEquivalent:event];
+}
+
+- (void)keyDown:(NSEvent *)event {
+    if ([self handleChoiceShortcut:event]) return;
+    [super keyDown:event];
+}
+
+- (void)sendEvent:(NSEvent *)event {
+    if ([self handleChoiceShortcut:event]) return;
+    [super sendEvent:event];
+}
+@end
+
+@interface SDAppDelegate : NSObject <NSApplicationDelegate, NSMenuItemValidation>
+- (void)handleGlobalMoveHotKey;
+- (BOOL)shouldHandleGlobalMoveHotKey;
+- (BOOL)matchesMoveShortcutKeyCode:(CGKeyCode)keyCode modifiers:(CGEventFlags)modifiers;
+// ai coding: 声明标准应用菜单和访达定位入口 2026/09/17: 09:06
+- (void)configureMainMenu;
+- (void)revealApplication:(id)sender;
+// ai coding: 声明批量名称解析、四边分布及批量新建菜单操作 2026/09/17: 11:23
+- (NSArray<NSString *> *)drawerNamesFromBatchInput:(NSString *)input;
+- (NSArray<NSDictionary *> *)batchPlacementsForCount:(NSUInteger)count;
+- (void)batchCreateDrawers:(id)sender;
+// ai coding: 声明快捷键录制、展示和多抽屉目标选择入口 2026/09/17: 09:19
+- (void)loadMoveShortcut;
+- (void)showShortcutConfiguration:(id)sender;
+- (BOOL)moveURLs:(NSArray<NSURL *> *)urls toDrawerID:(NSString *)drawerID;
+// ai coding: 声明菜单中的尺寸输入和剪贴板粘贴操作 2026/09/17: 14:10
+- (void)setCurrentDrawerDimension:(id)sender;
+- (void)pasteCurrentDrawer:(id)sender;
+// ai coding: 声明移动后异步刷新 Finder 并定位相邻项目的快捷键流程接口 2026/09/17: 13:22
+- (BOOL)chooseDrawerAndMoveURLs:(NSArray<NSURL *> *)urls;
+- (NSArray<NSDictionary *> *)finderSelectionSnapshotForURLs:(NSArray<NSURL *> *)urls;
+- (NSString *)finderNeighborPathForSelectionSnapshot:(NSArray<NSDictionary *> *)snapshots;
+- (void)selectFinderItemAtPath:(NSString *)path;
+// ai coding: 声明支持方向键、回车及数字快捷键的多收纳盒选择接口 2026/09/17: 11:23
+- (SDDrawerChoicePanel *)drawerChoicePanelForDrawers:(NSArray<NSDictionary *> *)drawers
+                                           itemCount:(NSInteger)itemCount;
+- (void)selectDrawerAtIndex:(NSInteger)index;
+- (void)selectDrawerFromList:(NSButton *)sender;
+- (void)cancelDrawerChoice:(id)sender;
+@end
+
+// ai coding: 将用户录制的修饰键转换为 Carbon 全局热键格式 2026/09/17: 09:44
+static UInt32 SDCarbonModifiersFromCGEventFlags(CGEventFlags flags) {
+    UInt32 result = 0;
+    if (flags & kCGEventFlagMaskCommand) result |= cmdKey;
+    if (flags & kCGEventFlagMaskShift) result |= shiftKey;
+    if (flags & kCGEventFlagMaskAlternate) result |= optionKey;
+    if (flags & kCGEventFlagMaskControl) result |= controlKey;
+    return result;
+}
+
+// ai coding: 使用系统原生热键事件触发 Finder 文件移动，不再依赖辅助功能键盘监听 2026/09/17: 09:44
+static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
+                                      EventRef event,
+                                      void *userData) {
+    EventHotKeyID identifier = {0};
+    OSStatus status = GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID,
+                                        NULL, sizeof(identifier), NULL, &identifier);
+    if (status != noErr || identifier.signature != 'SDRW' || identifier.id != 1) {
+        return eventNotHandledErr;
+    }
+    SDAppDelegate *delegate = (__bridge SDAppDelegate *)userData;
+    if (![delegate shouldHandleGlobalMoveHotKey]) return eventNotHandledErr;
+    [delegate handleGlobalMoveHotKey];
+    return noErr;
+}
+
+@implementation SDAppDelegate {
+    SDDrawerStore *_store;
+    NSMutableDictionary<NSString *, SDDrawerPanelController *> *_controllers;
+    NSStatusItem *_statusItem;
+    NSMenuItem *_shortcutStatusItem;
+    NSMenuItem *_shortcutConfigurationItem;
+    EventHandlerRef _hotKeyEventHandler;
+    EventHotKeyRef _hotKey;
+    OSStatus _hotKeyRegistrationStatus;
+    CGKeyCode _moveShortcutKeyCode;
+    CGEventFlags _moveShortcutModifiers;
+    NSString *_moveShortcutKeyName;
+    // ai coding: 保存最后激活的收纳盒标识以路由菜单操作 2026/09/17: 10:47
+    NSString *_activeDrawerID;
+    // ai coding: 保存快捷键选择面板和目标映射以支持点击即移动 2026/09/17: 11:05
+    SDDrawerChoicePanel *_drawerChoicePanel;
+    NSArray<NSString *> *_drawerChoiceIDs;
+    NSString *_selectedDrawerChoiceID;
+}
+
+- (void)configureApplicationIcon {
+    // ai coding: 启动时显式加载 bundle 图标，确保 Dock 和快捷键面板都能显示 2026/09/17: 11:44
+    NSString *iconPath = [NSBundle.mainBundle pathForResource:@"SideDrawer" ofType:@"icns"];
+    if (iconPath.length == 0) return;
+    NSImage *icon = [[NSImage alloc] initWithContentsOfFile:iconPath];
+    if (icon) NSApp.applicationIconImage = icon;
+}
+
+- (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    // ai coding: 启用标准 Dock 图标并在启动时主动刷新应用图标 2026/09/17: 11:44
+    [self configureApplicationIcon];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [self loadMoveShortcut];
+    [self configureMainMenu];
+    NSError *error = nil;
+    _store = [[SDDrawerStore alloc] initWithError:&error];
+    if (!_store) {
+        [[NSAlert alertWithError:error] runModal];
+        [NSApp terminate:nil];
+        return;
+    }
+    _controllers = [NSMutableDictionary dictionary];
+    [self installGlobalHotKeyHandler];
+    [self updateConditionalKeyboardShortcut];
+    [self syncPanels];
+    [self configureStatusItem];
+    [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self
+                                                       selector:@selector(frontmostApplicationChanged:)
+                                                           name:NSWorkspaceDidActivateApplicationNotification
+                                                         object:nil];
+}
+
+- (void)syncPanels {
+    NSMutableSet<NSString *> *activeIDs = [NSMutableSet set];
+    __weak typeof(self) weakSelf = self;
+    for (NSDictionary *drawer in _store.drawers) {
+        NSString *drawerID = drawer[@"id"];
+        [activeIDs addObject:drawerID];
+        SDDrawerPanelController *controller = _controllers[drawerID];
+        if (!controller) {
+            controller = [[SDDrawerPanelController alloc] initWithStore:_store drawerID:drawerID];
+            controller.deleteHandler = ^(NSString *identifier) { [weakSelf deleteDrawerID:identifier]; };
+            controller.newDrawerHandler = ^{ [weakSelf createDrawer:nil]; };
+            // ai coding: 记录最后激活的收纳盒，供顶部菜单操作准确定位目标 2026/09/17: 10:47
+            controller.activationHandler = ^(NSString *identifier) {
+                SDAppDelegate *strongSelf = weakSelf;
+                if (strongSelf) strongSelf->_activeDrawerID = [identifier copy];
+            };
+            _controllers[drawerID] = controller;
+        }
+        if (!_activeDrawerID) _activeDrawerID = [drawerID copy];
+        [controller show];
+    }
+    for (NSString *drawerID in _controllers.allKeys.copy) {
+        if (![activeIDs containsObject:drawerID]) {
+            [_controllers[drawerID].panel close];
+            [_controllers removeObjectForKey:drawerID];
+            if ([_activeDrawerID isEqualToString:drawerID]) _activeDrawerID = nil;
+        }
+    }
+}
+
+// ai coding: 安装 Carbon 热键处理器，并仅在 Finder 位于前台时注册用户快捷键 2026/09/17: 09:44
+- (void)installGlobalHotKeyHandler {
+    if (_hotKeyEventHandler) return;
+    EventTypeSpec eventType = {kEventClassKeyboard, kEventHotKeyPressed};
+    _hotKeyRegistrationStatus = InstallApplicationEventHandler(&SDGlobalHotKeyHandler,
+                                                                1,
+                                                                &eventType,
+                                                                (__bridge void *)self,
+                                                                &_hotKeyEventHandler);
+}
+
+- (void)updateConditionalKeyboardShortcut {
+    if (_hotKey) {
+        UnregisterEventHotKey(_hotKey);
+        _hotKey = NULL;
+    }
+    if (![self shouldHandleGlobalMoveHotKey]) {
+        [self refreshShortcutStatusItem];
+        return;
+    }
+    EventHotKeyID identifier = {'SDRW', 1};
+    _hotKeyRegistrationStatus = RegisterEventHotKey(_moveShortcutKeyCode,
+                                                     SDCarbonModifiersFromCGEventFlags(_moveShortcutModifiers),
+                                                     identifier,
+                                                     GetApplicationEventTarget(),
+                                                     0,
+                                                     &_hotKey);
+    [self refreshShortcutStatusItem];
+}
+
+- (void)frontmostApplicationChanged:(NSNotification *)notification {
+    [self updateConditionalKeyboardShortcut];
+}
+
+- (BOOL)shouldHandleGlobalMoveHotKey {
+    BOOL finderIsFrontmost = [NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier isEqualToString:@"com.apple.finder"];
+    return _store.drawers.count > 0 && finderIsFrontmost;
+}
+
+// ai coding: 读取、匹配并保存用户自定义的 Finder 移动快捷键 2026/09/17: 09:19
+- (void)loadMoveShortcut {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if ([defaults objectForKey:SDShortcutKeyCodeDefaultsKey] == nil) {
+        _moveShortcutKeyCode = 46;
+        _moveShortcutModifiers = kCGEventFlagMaskCommand;
+        _moveShortcutKeyName = @"M";
+        return;
+    }
+    _moveShortcutKeyCode = (CGKeyCode)[defaults integerForKey:SDShortcutKeyCodeDefaultsKey];
+    _moveShortcutModifiers = (CGEventFlags)[defaults integerForKey:SDShortcutModifiersDefaultsKey];
+    _moveShortcutKeyName = [defaults stringForKey:SDShortcutKeyNameDefaultsKey] ?: @"M";
+}
+
+- (BOOL)matchesMoveShortcutKeyCode:(CGKeyCode)keyCode modifiers:(CGEventFlags)modifiers {
+    CGEventFlags relevant = modifiers &
+        (kCGEventFlagMaskCommand | kCGEventFlagMaskShift | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate);
+    return keyCode == _moveShortcutKeyCode && relevant == _moveShortcutModifiers;
+}
+
+- (void)showShortcutConfiguration:(id)sender {
+    [NSApp activateIgnoringOtherApps:YES];
+    SDShortcutRecorderView *recorder = [[SDShortcutRecorderView alloc] initWithKeyCode:_moveShortcutKeyCode
+                                                                             modifiers:_moveShortcutModifiers
+                                                                                keyName:_moveShortcutKeyName];
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"设置移动到收纳箱的快捷键";
+    alert.informativeText = @"点击输入框，然后按下包含 ⌘、⌥ 或 ⌃ 的组合键。默认快捷键是 ⌘M。";
+    alert.accessoryView = recorder;
+    [alert addButtonWithTitle:@"保存"];
+    [alert addButtonWithTitle:@"取消"];
+    [alert addButtonWithTitle:@"恢复 ⌘M"];
+    alert.window.initialFirstResponder = recorder;
+    dispatch_async(dispatch_get_main_queue(), ^{ [alert.window makeFirstResponder:recorder]; });
+    NSModalResponse response = [alert runModal];
+    if (response == NSAlertSecondButtonReturn) return;
+    if (response == NSAlertThirdButtonReturn) {
+        _moveShortcutKeyCode = 46;
+        _moveShortcutModifiers = kCGEventFlagMaskCommand;
+        _moveShortcutKeyName = @"M";
+    } else {
+        if (!recorder.hasValidShortcut) {
+            [self showError:SDError(8, @"快捷键需要包含 Command、Option 或 Control。") window:nil];
+            return;
+        }
+        _moveShortcutKeyCode = recorder.recordedKeyCode;
+        _moveShortcutModifiers = recorder.recordedModifiers;
+        _moveShortcutKeyName = recorder.recordedKeyName;
+    }
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults setInteger:_moveShortcutKeyCode forKey:SDShortcutKeyCodeDefaultsKey];
+    [defaults setInteger:(NSInteger)_moveShortcutModifiers forKey:SDShortcutModifiersDefaultsKey];
+    [defaults setObject:_moveShortcutKeyName forKey:SDShortcutKeyNameDefaultsKey];
+    [self updateConditionalKeyboardShortcut];
+}
+
+- (void)configureStatusItem {
+    _statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
+    _statusItem.button.image = [NSImage imageWithSystemSymbolName:@"rectangle.stack.fill" accessibilityDescription:@"SideDrawer"];
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"SideDrawer"];
+    // ai coding: 在状态菜单增加尺寸输入和粘贴，并保留批量新建和常用操作 2026/09/17: 14:10
+    NSMenuItem *newDrawer = [[NSMenuItem alloc] initWithTitle:@"新建收纳盒" action:@selector(createDrawer:) keyEquivalent:@"n"];
+    newDrawer.target = self;
+    [menu addItem:newDrawer];
+    NSMenuItem *dimension = [[NSMenuItem alloc] initWithTitle:@"设置当前抽屉高度/宽度…"
+                                                       action:@selector(setCurrentDrawerDimension:)
+                                                keyEquivalent:@""];
+    dimension.target = self;
+    [menu addItem:dimension];
+    NSMenuItem *paste = [[NSMenuItem alloc] initWithTitle:@"粘贴到当前收纳盒"
+                                                   action:@selector(pasteCurrentDrawer:)
+                                            keyEquivalent:@"v"];
+    paste.target = self;
+    [menu addItem:paste];
+    NSMenuItem *batchNewDrawer = [[NSMenuItem alloc] initWithTitle:@"批量新建收纳盒…"
+                                                            action:@selector(batchCreateDrawers:)
+                                                     keyEquivalent:@""];
+    batchNewDrawer.target = self;
+    [menu addItem:batchNewDrawer];
+    NSMenuItem *clearEmptyDrawers = [[NSMenuItem alloc] initWithTitle:@"一键清空空收纳盒"
+                                                                action:@selector(deleteEmptyDrawers:)
+                                                         keyEquivalent:@""];
+    clearEmptyDrawers.target = self;
+    [menu addItem:clearEmptyDrawers];
+    NSMenuItem *saveDrawer = [[NSMenuItem alloc] initWithTitle:@"保存当前收纳盒为文件夹…"
+                                                       action:@selector(saveCurrentDrawer:)
+                                                keyEquivalent:@"s"];
+    saveDrawer.target = self;
+    [menu addItem:saveDrawer];
+    NSMenuItem *selectAll = [[NSMenuItem alloc] initWithTitle:@"全选当前收纳盒文件"
+                                                      action:@selector(selectAllCurrentDrawer:)
+                                               keyEquivalent:@"a"];
+    selectAll.target = self;
+    [menu addItem:selectAll];
+    unichar deleteCharacter = NSDeleteCharacter;
+    NSString *deleteKey = [NSString stringWithCharacters:&deleteCharacter length:1];
+    NSMenuItem *deleteItems = [[NSMenuItem alloc] initWithTitle:@"将所选项目移到废纸篓"
+                                                        action:@selector(deleteSelectedInCurrentDrawer:)
+                                                 keyEquivalent:deleteKey];
+    deleteItems.keyEquivalentModifierMask = 0;
+    deleteItems.target = self;
+    [menu addItem:deleteItems];
+    [menu addItem:NSMenuItem.separatorItem];
+    // ai coding: 在菜单栏展示免辅助功能权限的原生全局快捷键状态 2026/09/17: 09:44
+    _shortcutConfigurationItem = [[NSMenuItem alloc] initWithTitle:@"设置移动快捷键…"
+                                                            action:@selector(showShortcutConfiguration:)
+                                                     keyEquivalent:@""];
+    _shortcutConfigurationItem.target = self;
+    [menu addItem:_shortcutConfigurationItem];
+    _shortcutStatusItem = [[NSMenuItem alloc] initWithTitle:@"快捷键已就绪" action:nil keyEquivalent:@""];
+    [menu addItem:_shortcutStatusItem];
+    [self refreshShortcutStatusItem];
+    NSMenuItem *showAll = [[NSMenuItem alloc] initWithTitle:@"显示全部抽屉" action:@selector(showAll:) keyEquivalent:@""];
+    showAll.target = self;
+    [menu addItem:showAll];
+    NSMenuItem *hideAll = [[NSMenuItem alloc] initWithTitle:@"隐藏全部抽屉" action:@selector(hideAll:) keyEquivalent:@""];
+    hideAll.target = self;
+    [menu addItem:hideAll];
+    NSMenuItem *reveal = [[NSMenuItem alloc] initWithTitle:@"在访达中显示 SideDrawer"
+                                                    action:@selector(revealApplication:)
+                                             keyEquivalent:@""];
+    reveal.target = self;
+    [menu addItem:reveal];
+    [menu addItem:NSMenuItem.separatorItem];
+    NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle:@"退出 SideDrawer" action:@selector(quit:) keyEquivalent:@"q"];
+    quit.target = self;
+    [menu addItem:quit];
+    _statusItem.menu = menu;
+}
+
+// ai coding: 在标准菜单增加尺寸输入和粘贴，并保留批量新建和常用操作 2026/09/17: 14:10
+- (void)configureMainMenu {
+    NSMenu *mainMenu = [[NSMenu alloc] initWithTitle:@"MainMenu"];
+    NSMenuItem *applicationItem = [[NSMenuItem alloc] initWithTitle:@"SideDrawer" action:nil keyEquivalent:@""];
+    NSMenu *applicationMenu = [[NSMenu alloc] initWithTitle:@"SideDrawer"];
+    NSMenuItem *about = [[NSMenuItem alloc] initWithTitle:@"关于 SideDrawer"
+                                                   action:@selector(orderFrontStandardAboutPanel:)
+                                            keyEquivalent:@""];
+    about.target = NSApp;
+    [applicationMenu addItem:about];
+    NSMenuItem *shortcut = [[NSMenuItem alloc] initWithTitle:@"设置移动快捷键…"
+                                                      action:@selector(showShortcutConfiguration:)
+                                               keyEquivalent:@""];
+    shortcut.target = self;
+    [applicationMenu addItem:shortcut];
+    NSMenuItem *reveal = [[NSMenuItem alloc] initWithTitle:@"在访达中显示 SideDrawer"
+                                                    action:@selector(revealApplication:)
+                                             keyEquivalent:@""];
+    reveal.target = self;
+    [applicationMenu addItem:reveal];
+    [applicationMenu addItem:NSMenuItem.separatorItem];
+    NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle:@"退出 SideDrawer"
+                                                  action:@selector(terminate:)
+                                           keyEquivalent:@"q"];
+    quit.target = NSApp;
+    [applicationMenu addItem:quit];
+    applicationItem.submenu = applicationMenu;
+    [mainMenu addItem:applicationItem];
+
+    NSMenuItem *drawerMenuItem = [[NSMenuItem alloc] initWithTitle:@"收纳盒" action:nil keyEquivalent:@""];
+    NSMenu *drawerMenu = [[NSMenu alloc] initWithTitle:@"收纳盒"];
+    NSMenuItem *newDrawer = [[NSMenuItem alloc] initWithTitle:@"新建收纳盒"
+                                                      action:@selector(createDrawer:)
+                                               keyEquivalent:@"n"];
+    newDrawer.target = self;
+    [drawerMenu addItem:newDrawer];
+    NSMenuItem *dimension = [[NSMenuItem alloc] initWithTitle:@"设置当前抽屉高度/宽度…"
+                                                       action:@selector(setCurrentDrawerDimension:)
+                                                keyEquivalent:@""];
+    dimension.target = self;
+    [drawerMenu addItem:dimension];
+    NSMenuItem *paste = [[NSMenuItem alloc] initWithTitle:@"粘贴到当前收纳盒"
+                                                   action:@selector(pasteCurrentDrawer:)
+                                            keyEquivalent:@"v"];
+    paste.target = self;
+    [drawerMenu addItem:paste];
+    NSMenuItem *batchNewDrawer = [[NSMenuItem alloc] initWithTitle:@"批量新建收纳盒…"
+                                                            action:@selector(batchCreateDrawers:)
+                                                     keyEquivalent:@""];
+    batchNewDrawer.target = self;
+    [drawerMenu addItem:batchNewDrawer];
+    NSMenuItem *clearEmptyDrawers = [[NSMenuItem alloc] initWithTitle:@"一键清空空收纳盒"
+                                                                action:@selector(deleteEmptyDrawers:)
+                                                         keyEquivalent:@""];
+    clearEmptyDrawers.target = self;
+    [drawerMenu addItem:clearEmptyDrawers];
+    NSMenuItem *saveDrawer = [[NSMenuItem alloc] initWithTitle:@"保存当前收纳盒为文件夹…"
+                                                       action:@selector(saveCurrentDrawer:)
+                                                keyEquivalent:@"s"];
+    saveDrawer.target = self;
+    [drawerMenu addItem:saveDrawer];
+    [drawerMenu addItem:NSMenuItem.separatorItem];
+    NSMenuItem *selectAll = [[NSMenuItem alloc] initWithTitle:@"全选当前收纳盒文件"
+                                                      action:@selector(selectAllCurrentDrawer:)
+                                               keyEquivalent:@"a"];
+    selectAll.target = self;
+    [drawerMenu addItem:selectAll];
+    unichar deleteCharacter = NSDeleteCharacter;
+    NSString *deleteKey = [NSString stringWithCharacters:&deleteCharacter length:1];
+    NSMenuItem *deleteItems = [[NSMenuItem alloc] initWithTitle:@"将所选项目移到废纸篓"
+                                                        action:@selector(deleteSelectedInCurrentDrawer:)
+                                                 keyEquivalent:deleteKey];
+    deleteItems.keyEquivalentModifierMask = 0;
+    deleteItems.target = self;
+    [drawerMenu addItem:deleteItems];
+    drawerMenuItem.submenu = drawerMenu;
+    [mainMenu addItem:drawerMenuItem];
+    NSApp.mainMenu = mainMenu;
+}
+
+// ai coding: 将菜单命令路由到最后激活的收纳盒并避免编辑名称时误删文件 2026/09/17: 10:47
+- (SDDrawerPanelController *)activeDrawerController {
+    SDDrawerPanelController *controller = _activeDrawerID ? _controllers[_activeDrawerID] : nil;
+    if (controller) return controller;
+    for (SDDrawerPanelController *candidate in _controllers.allValues) {
+        if (candidate.panel.isKeyWindow) return candidate;
+    }
+    return _controllers.allValues.firstObject;
+}
+
+- (void)selectAllCurrentDrawer:(id)sender {
+    SDDrawerPanelController *controller = [self activeDrawerController];
+    [controller show];
+    [controller selectAllItems];
+}
+
+- (void)saveCurrentDrawer:(id)sender {
+    SDDrawerPanelController *controller = [self activeDrawerController];
+    [controller show];
+    [controller saveDrawerAsFolder];
+}
+
+- (void)deleteSelectedInCurrentDrawer:(id)sender {
+    [[self activeDrawerController] deleteSelectedItems];
+}
+
+// ai coding: 弹出数字输入框并按吸附方向设置当前抽屉的高度或宽度 2026/09/17: 14:10
+- (void)setCurrentDrawerDimension:(id)sender {
+    SDDrawerPanelController *controller = [self activeDrawerController];
+    if (!controller) return;
+    [controller show];
+    NSDictionary *drawer = [_store drawerForID:controller.drawerID];
+    NSString *edge = drawer[@"edge"] ?: SDEdgeRight;
+    BOOL horizontal = SDEdgeIsHorizontal(edge);
+    NSString *dimensionName = horizontal ? @"高度" : @"宽度";
+    NSTextField *input = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 210, 26)];
+    input.stringValue = [NSString stringWithFormat:@"%.0f", [controller currentDrawerThickness]];
+    input.alignment = NSTextAlignmentRight;
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = [NSString stringWithFormat:@"设置当前抽屉%@", dimensionName];
+    alert.informativeText = @"单位：像素。上下贴边输入高度，左右贴边输入宽度。";
+    alert.accessoryView = input;
+    [alert addButtonWithTitle:@"应用"];
+    [alert addButtonWithTitle:@"取消"];
+    alert.window.initialFirstResponder = input;
+    dispatch_async(dispatch_get_main_queue(), ^{ [alert.window makeFirstResponder:input]; });
+    if ([alert runModal] != NSAlertFirstButtonReturn) return;
+    CGFloat value = input.doubleValue;
+    if (!isfinite(value) || value <= 0) {
+        [self showError:SDError(13, @"请输入大于 0 的数字。") window:controller.panel];
+        return;
+    }
+    [controller setDrawerThickness:value];
+}
+
+// ai coding: 将菜单中的粘贴命令路由到当前激活的收纳盒 2026/09/17: 14:10
+- (void)pasteCurrentDrawer:(id)sender {
+    SDDrawerPanelController *controller = [self activeDrawerController];
+    if (!controller) return;
+    [controller show];
+    [controller pasteFromPasteboard];
+}
+
+// ai coding: 执行菜单中的一键清空空收纳盒并同步剩余窗口 2026/09/17: 11:30
+- (void)deleteEmptyDrawers:(id)sender {
+    NSError *error = nil;
+    NSUInteger removedCount = [_store deleteEmptyDrawers:&error];
+    if (removedCount > 0) [self syncPanels];
+    if (error) [self showError:error window:nil];
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem *)menuItem {
+    SEL action = menuItem.action;
+    if (action == @selector(deleteEmptyDrawers:)) return [_store hasDeletableEmptyDrawers];
+    if (action == @selector(setCurrentDrawerDimension:) || action == @selector(pasteCurrentDrawer:)) {
+        SDDrawerPanelController *controller = [self activeDrawerController];
+        if (!controller) return NO;
+        if (action == @selector(pasteCurrentDrawer:) && [controller isEditingDrawerName]) return NO;
+    }
+    if (action == @selector(selectAllCurrentDrawer:) || action == @selector(saveCurrentDrawer:) ||
+        action == @selector(deleteSelectedInCurrentDrawer:)) {
+        SDDrawerPanelController *controller = [self activeDrawerController];
+        if (!controller) return NO;
+        if (action == @selector(deleteSelectedInCurrentDrawer:) && [controller isEditingDrawerName]) return NO;
+    }
+    return YES;
+}
+
+- (void)revealApplication:(id)sender {
+    [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[NSBundle.mainBundle.bundleURL]];
+}
+
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)hasVisibleWindows {
+    if (!hasVisibleWindows) [self showAll:nil];
+    return YES;
+}
+
+- (void)createDrawer:(id)sender {
+    NSError *error = nil;
+    SDDrawerPanelController *sourceController = [self activeDrawerController];
+    // ai coding: 单个新建复制当前激活抽屉尺寸，并在完成后直接聚焦名称 2026/09/17: 11:14
+    NSString *drawerID = [_store addDrawerWithName:nil
+                    copyingDimensionsFromDrawerID:sourceController.drawerID
+                                             error:&error];
+    if (!drawerID) {
+        [self showError:error window:nil];
+        return;
+    }
+    [self syncPanels];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self->_controllers[drawerID] beginRenaming];
+    });
+}
+
+// ai coding: 将中英文逗号分隔的输入清理为非空收纳盒名称列表 2026/09/17: 11:14
+- (NSArray<NSString *> *)drawerNamesFromBatchInput:(NSString *)input {
+    NSCharacterSet *separators = [NSCharacterSet characterSetWithCharactersInString:@",，"];
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (NSString *component in [input componentsSeparatedByCharactersInSet:separators]) {
+        NSString *name = [component stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (name.length > 0) [names addObject:name];
+    }
+    return names;
+}
+
+// ai coding: 为批量创建计算上、下、左、右循环分布及同边均匀间距 2026/09/17: 11:23
+- (NSArray<NSDictionary *> *)batchPlacementsForCount:(NSUInteger)count {
+    NSArray<NSString *> *edges = @[SDEdgeTop, SDEdgeBottom, SDEdgeLeft, SDEdgeRight];
+    NSMutableDictionary<NSString *, NSNumber *> *counts = [NSMutableDictionary dictionary];
+    for (NSUInteger index = 0; index < count; index++) {
+        NSString *edge = edges[index % edges.count];
+        counts[edge] = @([counts[edge] unsignedIntegerValue] + 1);
+    }
+    NSMutableDictionary<NSString *, NSNumber *> *used = [NSMutableDictionary dictionary];
+    NSMutableArray<NSDictionary *> *placements = [NSMutableArray arrayWithCapacity:count];
+    for (NSUInteger index = 0; index < count; index++) {
+        NSString *edge = edges[index % edges.count];
+        NSUInteger edgeCount = [counts[edge] unsignedIntegerValue];
+        NSUInteger edgeIndex = [used[edge] unsignedIntegerValue];
+        CGFloat position = edgeCount <= 1 ? 0.5 : (CGFloat)edgeIndex / (CGFloat)(edgeCount - 1);
+        [placements addObject:@{@"edge": edge, @"position": @(position)}];
+        used[edge] = @(edgeIndex + 1);
+    }
+    return placements;
+}
+
+// ai coding: 批量创建后覆盖默认位置，使新收纳盒立即散布在屏幕四边 2026/09/17: 11:26
+- (void)batchCreateDrawers:(id)sender {
+    [NSApp activateIgnoringOtherApps:YES];
+    NSTextField *input = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 280, 26)];
+    input.placeholderString = @"例如：a,b,c";
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"批量新建收纳盒";
+    alert.informativeText = @"输入名称并用逗号分隔；中文逗号和英文逗号效果相同。";
+    alert.accessoryView = input;
+    [alert addButtonWithTitle:@"新建"];
+    [alert addButtonWithTitle:@"取消"];
+    alert.window.initialFirstResponder = input;
+    dispatch_async(dispatch_get_main_queue(), ^{ [alert.window makeFirstResponder:input]; });
+    if ([alert runModal] != NSAlertFirstButtonReturn) return;
+
+    NSArray<NSString *> *names = [self drawerNamesFromBatchInput:input.stringValue];
+    if (names.count == 0) {
+        [self showError:SDError(10, @"请至少输入一个收纳盒名称。") window:nil];
+        return;
+    }
+    NSString *sourceDrawerID = [self activeDrawerController].drawerID;
+    NSMutableArray<NSString *> *createdDrawerIDs = [NSMutableArray arrayWithCapacity:names.count];
+    NSArray<NSDictionary *> *placements = [self batchPlacementsForCount:names.count];
+    NSError *error = nil;
+    for (NSUInteger index = 0; index < names.count; index++) {
+        NSString *name = names[index];
+        NSString *drawerID = [_store addDrawerWithName:name
+                        copyingDimensionsFromDrawerID:sourceDrawerID
+                                                 error:&error];
+        if (!drawerID) break;
+        NSDictionary *placement = placements[index];
+        [_store updateDrawerID:drawerID edge:placement[@"edge"] position:[placement[@"position"] doubleValue]];
+        [createdDrawerIDs addObject:drawerID];
+    }
+    if (createdDrawerIDs.count > 0) {
+        _activeDrawerID = createdDrawerIDs.lastObject;
+        [self syncPanels];
+    }
+    if (error) [self showError:error window:nil];
+}
+
+- (void)deleteDrawerID:(NSString *)drawerID {
+    NSError *error = nil;
+    if (![_store deleteDrawerID:drawerID error:&error]) {
+        [self showError:error window:_controllers[drawerID].panel];
+        return;
+    }
+    [self syncPanels];
+}
+
+// ai coding: 显示原生快捷键注册结果并在冲突时提供重新设置入口 2026/09/17: 09:44
+- (void)refreshShortcutStatusItem {
+    NSString *shortcut = SDShortcutDisplayString(_moveShortcutModifiers, _moveShortcutKeyName);
+    if (_shortcutConfigurationItem) {
+        _shortcutConfigurationItem.title = [NSString stringWithFormat:@"设置移动快捷键…（%@）", shortcut];
+    }
+    if (!_shortcutStatusItem) return;
+    BOOL failed = _hotKeyRegistrationStatus != noErr;
+    _shortcutStatusItem.title = failed
+        ? @"快捷键注册失败，请更换组合键…"
+        : [NSString stringWithFormat:@"快捷键已就绪：%@", shortcut];
+    _shortcutStatusItem.target = failed ? self : nil;
+    _shortcutStatusItem.action = failed ? @selector(showShortcutConfiguration:) : nil;
+    _shortcutStatusItem.enabled = failed;
+}
+
+// ai coding: 快捷键先完成文件移动，再异步刷新 Finder 并选中相邻项目 2026/09/17: 13:22
+- (void)handleGlobalMoveHotKey {
+    if (_store.drawers.count == 0) return;
+    NSString *source = @"tell application \"Finder\"\n"
+                        "set selectedItems to selection\n"
+                        "set posixPaths to {}\n"
+                        "repeat with selectedItem in selectedItems\n"
+                        "set end of posixPaths to POSIX path of (selectedItem as alias)\n"
+                        "end repeat\n"
+                        "return posixPaths\n"
+                        "end tell";
+    NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
+    NSDictionary *scriptError = nil;
+    NSAppleEventDescriptor *result = [script executeAndReturnError:&scriptError];
+    if (!result) {
+        NSString *message = scriptError[NSAppleScriptErrorMessage] ?: @"无法读取 Finder 当前选中的项目。";
+        NSError *error = SDError([scriptError[NSAppleScriptErrorNumber] integerValue], message);
+        [self showError:error window:_controllers.allValues.firstObject.panel];
+        return;
+    }
+    NSMutableArray<NSURL *> *urls = [NSMutableArray array];
+    for (NSInteger index = 1; index <= result.numberOfItems; index++) {
+        NSString *path = [result descriptorAtIndex:index].stringValue;
+        if (path.length > 0) [urls addObject:[NSURL fileURLWithPath:path]];
+    }
+    if (urls.count == 0) {
+        NSBeep();
+        return;
+    }
+    NSArray<NSDictionary *> *selectionSnapshot = [self finderSelectionSnapshotForURLs:urls];
+    BOOL moved = NO;
+    if (_store.drawers.count == 1) {
+        moved = [self moveURLs:urls toDrawerID:_store.drawers.firstObject[@"id"]];
+    } else {
+        moved = [self chooseDrawerAndMoveURLs:urls];
+    }
+    if (!moved) return;
+    NSArray<NSDictionary *> *movedSelectionSnapshot = [selectionSnapshot copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            NSString *neighborPath = [self finderNeighborPathForSelectionSnapshot:movedSelectionSnapshot];
+            if (neighborPath.length == 0) return;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self selectFinderItemAtPath:neighborPath];
+            });
+        }
+    });
+}
+
+// ai coding: 多个收纳盒选择目标后返回移动结果以便定位相邻 Finder 项目 2026/09/17: 11:51
+- (BOOL)chooseDrawerAndMoveURLs:(NSArray<NSURL *> *)urls {
+    [NSApp activateIgnoringOtherApps:YES];
+    _selectedDrawerChoiceID = nil;
+    _drawerChoicePanel = [self drawerChoicePanelForDrawers:_store.drawers itemCount:urls.count];
+    [_drawerChoicePanel center];
+    [_drawerChoicePanel makeKeyAndOrderFront:nil];
+    NSModalResponse response = [NSApp runModalForWindow:_drawerChoicePanel];
+    [_drawerChoicePanel orderOut:nil];
+    NSString *drawerID = [_selectedDrawerChoiceID copy];
+    _drawerChoicePanel = nil;
+    _drawerChoiceIDs = nil;
+    _selectedDrawerChoiceID = nil;
+    if (response != NSModalResponseOK || drawerID.length == 0) return NO;
+    return [self moveURLs:urls toDrawerID:drawerID];
+}
+
+// ai coding: 在移动前只读取本地文件属性快照，避免等待 Finder 排序脚本后才开始移动 2026/09/17: 13:22
+- (NSArray<NSDictionary *> *)finderSelectionSnapshotForURLs:(NSArray<NSURL *> *)urls {
+    NSArray<NSURLResourceKey> *keys = @[
+        NSURLNameKey, NSURLIsDirectoryKey, NSURLFileSizeKey,
+        NSURLContentModificationDateKey, NSURLCreationDateKey,
+        NSURLLocalizedTypeDescriptionKey
+    ];
+    NSMutableArray<NSDictionary *> *snapshots = [NSMutableArray arrayWithCapacity:urls.count];
+    for (NSURL *url in urls) {
+        NSURL *standardURL = url.URLByStandardizingPath;
+        NSDictionary<NSURLResourceKey, id> *values = [standardURL resourceValuesForKeys:keys error:nil];
+        NSString *path = standardURL.path;
+        NSString *name = values[NSURLNameKey] ?: standardURL.lastPathComponent ?: @"";
+        BOOL isDirectory = [values[NSURLIsDirectoryKey] boolValue];
+        NSString *kind = values[NSURLLocalizedTypeDescriptionKey];
+        if (kind.length == 0) kind = isDirectory ? @"文件夹" : (standardURL.pathExtension.length > 0 ? standardURL.pathExtension : @"文件");
+        [snapshots addObject:@{
+            @"path": path ?: @"",
+            @"directory": standardURL.URLByDeletingLastPathComponent.path ?: @"",
+            @"name": name,
+            @"kind": kind,
+            @"size": values[NSURLFileSizeKey] ?: @0,
+            @"modificationDate": values[NSURLContentModificationDateKey] ?: [NSDate distantPast],
+            @"creationDate": values[NSURLCreationDateKey] ?: [NSDate distantPast]
+        }];
+    }
+    return snapshots;
+}
+
+// ai coding: 移动后在后台刷新 Finder 并按当前视图规则计算下一个或上一个项目 2026/09/17: 13:22
+- (NSString *)finderNeighborPathForSelectionSnapshot:(NSArray<NSDictionary *> *)snapshots {
+    if (snapshots.count == 0) return @"";
+    NSString *sourceDirectoryPath = snapshots.firstObject[@"directory"];
+    if (sourceDirectoryPath.length == 0) return @"";
+    for (NSDictionary *snapshot in snapshots) {
+        if (![snapshot[@"directory"] isEqualToString:sourceDirectoryPath]) return @"";
+    }
+    NSString *sortSource = @"tell application \"Finder\"\n"
+                            "set sortKey to \"name\"\n"
+                            "set reversedOrder to false\n"
+                            "try\n"
+                            "set currentWindow to front Finder window\n"
+                            "try\n"
+                            "update every item of currentWindow\n"
+                            "end try\n"
+                            "set currentView to current view of currentWindow\n"
+                            "if currentView is list view then\n"
+                            "set sortColumnName to name of sort column of list view options of currentWindow as text\n"
+                            "if sortColumnName is \"modification date column\" then set sortKey to \"modificationDate\"\n"
+                            "if sortColumnName is \"creation date column\" then set sortKey to \"creationDate\"\n"
+                            "if sortColumnName is \"size column\" then set sortKey to \"size\"\n"
+                            "if sortColumnName is \"kind column\" then set sortKey to \"kind\"\n"
+                            "if (sort direction of sort column of list view options of currentWindow) is reversed then set reversedOrder to true\n"
+                            "else if currentView is icon view then\n"
+                            "set arrangementMode to arrangement of icon view options of currentWindow\n"
+                            "if arrangementMode is arranged by modification date then set sortKey to \"modificationDate\"\n"
+                            "if arrangementMode is arranged by creation date then set sortKey to \"creationDate\"\n"
+                            "if arrangementMode is arranged by size then set sortKey to \"size\"\n"
+                            "if arrangementMode is arranged by kind then set sortKey to \"kind\"\n"
+                            "end if\n"
+                            "end try\n"
+                            "return sortKey & \"|\" & (reversedOrder as text)\n"
+                            "end tell";
+    NSAppleScript *sortScript = [[NSAppleScript alloc] initWithSource:sortSource];
+    NSAppleEventDescriptor *sortResult = [sortScript executeAndReturnError:nil];
+    NSArray<NSString *> *sortParts = [sortResult.stringValue componentsSeparatedByString:@"|"];
+    NSString *sortKey = sortParts.firstObject.length > 0 ? sortParts.firstObject : @"name";
+    BOOL reversedOrder = sortParts.count > 1 && [sortParts[1] boolValue];
+    NSURL *directoryURL = [NSURL fileURLWithPath:sourceDirectoryPath isDirectory:YES];
+    NSArray<NSURLResourceKey> *keys = @[
+        NSURLNameKey, NSURLIsDirectoryKey, NSURLFileSizeKey,
+        NSURLContentModificationDateKey, NSURLCreationDateKey,
+        NSURLLocalizedTypeDescriptionKey
+    ];
+    NSArray<NSURL *> *directoryURLs = [NSFileManager.defaultManager
+        contentsOfDirectoryAtURL:directoryURL
+        includingPropertiesForKeys:keys
+        options:NSDirectoryEnumerationSkipsHiddenFiles
+        error:nil];
+    if (directoryURLs.count == 0) return @"";
+    NSMutableArray<NSDictionary *> *records = [[self finderSelectionSnapshotForURLs:directoryURLs] mutableCopy];
+    [records addObjectsFromArray:snapshots];
+    [records sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
+        NSComparisonResult result = NSOrderedSame;
+        if ([sortKey isEqualToString:@"size"]) {
+            unsigned long long leftSize = [left[@"size"] unsignedLongLongValue];
+            unsigned long long rightSize = [right[@"size"] unsignedLongLongValue];
+            result = leftSize < rightSize ? NSOrderedAscending : (leftSize > rightSize ? NSOrderedDescending : NSOrderedSame);
+        } else if ([sortKey isEqualToString:@"modificationDate"] || [sortKey isEqualToString:@"creationDate"]) {
+            result = [left[sortKey] compare:right[sortKey]];
+        } else {
+            result = [left[sortKey] localizedStandardCompare:right[sortKey]];
+        }
+        if (result == NSOrderedSame && ![sortKey isEqualToString:@"name"]) {
+            result = [left[@"name"] localizedStandardCompare:right[@"name"]];
+        }
+        if (result == NSOrderedSame) result = [left[@"path"] localizedStandardCompare:right[@"path"]];
+        return reversedOrder ? (NSComparisonResult)-result : result;
+    }];
+    NSSet<NSString *> *selectedPaths = [NSSet setWithArray:[snapshots valueForKey:@"path"]];
+    NSUInteger minimumPosition = NSNotFound;
+    NSUInteger maximumPosition = NSNotFound;
+    for (NSUInteger index = 0; index < records.count; index++) {
+        if (![selectedPaths containsObject:records[index][@"path"]]) continue;
+        if (minimumPosition == NSNotFound) minimumPosition = index;
+        maximumPosition = index;
+    }
+    if (maximumPosition == NSNotFound) return @"";
+    if (maximumPosition + 1 < records.count) return records[maximumPosition + 1][@"path"];
+    if (minimumPosition > 0) return records[minimumPosition - 1][@"path"];
+    return @"";
+}
+
+// ai coding: 移动成功后延迟选中 Finder 相邻项目，避免容器刷新覆盖选择 2026/09/17: 11:51
+- (void)selectFinderItemAtPath:(NSString *)path {
+    if (path.length == 0) return;
+    NSString *escapedPath = SDEscapeAppleScriptString(path);
+    NSString *source = [NSString stringWithFormat:
+        @"tell application \"Finder\"\n"
+         "set targetItem to POSIX file \"%@\" as alias\n"
+         "set selection to {targetItem}\n"
+         "end tell", escapedPath];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
+        [script executeAndReturnError:nil];
+    });
+}
+
+// ai coding: 将列表项改为左侧纯名称、右侧快捷键提示且不显示图标或数量 2026/09/17: 11:23
+- (SDDrawerChoicePanel *)drawerChoicePanelForDrawers:(NSArray<NSDictionary *> *)drawers
+                                           itemCount:(NSInteger)itemCount {
+    CGFloat panelWidth = 168;
+    CGFloat contentInset = 12;
+    CGFloat innerWidth = panelWidth - contentInset * 2;
+    CGFloat rowHeight = 40;
+    CGFloat rowGap = 6;
+    NSUInteger visibleRows = MIN(drawers.count, (NSUInteger)6);
+    CGFloat visibleListHeight = visibleRows * rowHeight + (visibleRows > 0 ? (visibleRows - 1) * rowGap : 0);
+    CGFloat documentHeight = drawers.count * rowHeight + (drawers.count > 0 ? (drawers.count - 1) * rowGap : 0);
+    CGFloat cancelHeight = 36;
+    CGFloat headerHeight = 146;
+    CGFloat listBottom = contentInset + cancelHeight + 10;
+    CGFloat headerBottom = listBottom + visibleListHeight + 14;
+    CGFloat panelHeight = headerBottom + headerHeight + contentInset;
+
+    SDDrawerChoicePanel *panel = [[SDDrawerChoicePanel alloc]
+        initWithContentRect:NSMakeRect(0, 0, panelWidth, panelHeight)
+                  styleMask:NSWindowStyleMaskBorderless
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    panel.opaque = NO;
+    panel.backgroundColor = NSColor.clearColor;
+    panel.hasShadow = YES;
+    panel.level = NSFloatingWindowLevel;
+    panel.hidesOnDeactivate = NO;
+    panel.animationBehavior = NSWindowAnimationBehaviorUtilityWindow;
+    panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                               NSWindowCollectionBehaviorFullScreenAuxiliary;
+
+    NSVisualEffectView *background = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, panelWidth, panelHeight)];
+    background.material = NSVisualEffectMaterialPopover;
+    background.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+    background.state = NSVisualEffectStateActive;
+    background.wantsLayer = YES;
+    background.layer.cornerRadius = 20;
+    background.layer.masksToBounds = YES;
+    panel.contentView = background;
+
+    NSImageView *iconView = [[NSImageView alloc]
+        initWithFrame:NSMakeRect((panelWidth - 42) / 2, headerBottom + 100, 42, 42)];
+    iconView.image = NSApp.applicationIconImage ?: [NSImage imageNamed:NSImageNameApplicationIcon];
+    iconView.imageScaling = NSImageScaleProportionallyUpOrDown;
+    [background addSubview:iconView];
+
+    NSTextField *titleLabel = [NSTextField labelWithString:@"选择收纳箱"];
+    titleLabel.frame = NSMakeRect(contentInset, headerBottom + 69, innerWidth, 24);
+    titleLabel.font = [NSFont systemFontOfSize:17 weight:NSFontWeightSemibold];
+    titleLabel.textColor = NSColor.labelColor;
+    titleLabel.alignment = NSTextAlignmentCenter;
+    [background addSubview:titleLabel];
+
+    NSTextField *descriptionLabel = [NSTextField wrappingLabelWithString:
+        [NSString stringWithFormat:@"点击目标，将 Finder 中选中的 %ld 个项目立即移动过去：", (long)itemCount]];
+    descriptionLabel.frame = NSMakeRect(contentInset, headerBottom + 2, innerWidth, 60);
+    descriptionLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightRegular];
+    descriptionLabel.textColor = NSColor.secondaryLabelColor;
+    descriptionLabel.alignment = NSTextAlignmentCenter;
+    descriptionLabel.maximumNumberOfLines = 4;
+    [background addSubview:descriptionLabel];
+
+    SDFlippedView *document = [[SDFlippedView alloc] initWithFrame:NSMakeRect(0, 0, innerWidth, MAX(rowHeight, documentHeight))];
+    NSMutableArray<NSString *> *drawerIDs = [NSMutableArray arrayWithCapacity:drawers.count];
+    NSMutableArray<SDDrawerChoiceButton *> *choiceButtons = [NSMutableArray arrayWithCapacity:drawers.count];
+    [drawers enumerateObjectsUsingBlock:^(NSDictionary *drawer, NSUInteger index, BOOL *stop __unused) {
+        NSString *drawerID = drawer[@"id"] ?: @"";
+        [drawerIDs addObject:drawerID];
+        NSString *drawerName = drawer[@"name"] ?: @"未命名收纳盒";
+        NSString *shortcut = index < 9
+            ? [NSString stringWithFormat:@"⌘/⌥+%lu", (unsigned long)index + 1]
+            : @"";
+        SDDrawerChoiceButton *button = [[SDDrawerChoiceButton alloc] initWithName:drawerName shortcut:shortcut];
+        button.target = self;
+        button.action = @selector(selectDrawerFromList:);
+        button.tag = (NSInteger)index;
+        button.toolTip = index < 9
+            ? [NSString stringWithFormat:@"⌥%lu 或 ⌘%lu：%@", (unsigned long)index + 1,
+                                                        (unsigned long)index + 1, drawerName]
+            : drawerName;
+        button.frame = NSMakeRect(0, index * (rowHeight + rowGap), innerWidth, rowHeight);
+        [document addSubview:button];
+        [choiceButtons addObject:button];
+    }];
+    _drawerChoiceIDs = drawerIDs;
+    NSScrollView *scroll = [[NSScrollView alloc]
+        initWithFrame:NSMakeRect(contentInset, listBottom, innerWidth, visibleListHeight)];
+    scroll.drawsBackground = NO;
+    scroll.borderType = NSNoBorder;
+    scroll.hasVerticalScroller = documentHeight > visibleListHeight;
+    scroll.scrollerStyle = NSScrollerStyleOverlay;
+    scroll.autohidesScrollers = YES;
+    scroll.documentView = document;
+    [background addSubview:scroll];
+
+    NSButton *cancelButton = [NSButton buttonWithTitle:@"取消" target:self action:@selector(cancelDrawerChoice:)];
+    cancelButton.frame = NSMakeRect(contentInset, contentInset, innerWidth, cancelHeight);
+    cancelButton.bordered = YES;
+    cancelButton.bezelStyle = NSBezelStyleRounded;
+    cancelButton.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+    cancelButton.contentTintColor = NSColor.labelColor;
+    cancelButton.keyEquivalent = @"\e";
+    [background addSubview:cancelButton];
+    __weak typeof(self) weakSelf = self;
+    panel.selectionHandler = ^(NSInteger index) {
+        [weakSelf selectDrawerAtIndex:index];
+    };
+    panel.choiceButtons = choiceButtons;
+    panel.selectedIndex = 0;
+    return panel;
+}
+
+// ai coding: 统一处理鼠标、回车和数字快捷键选择，并保留 Escape 关闭 2026/09/17: 11:23
+- (void)selectDrawerAtIndex:(NSInteger)index {
+    if (index < 0 || index >= (NSInteger)_drawerChoiceIDs.count) return;
+    _selectedDrawerChoiceID = [_drawerChoiceIDs[(NSUInteger)index] copy];
+    if (NSApp.modalWindow) [NSApp stopModalWithCode:NSModalResponseOK];
+}
+
+- (void)selectDrawerFromList:(NSButton *)sender {
+    [self selectDrawerAtIndex:sender.tag];
+}
+
+- (void)cancelDrawerChoice:(id)sender {
+    [NSApp stopModalWithCode:NSModalResponseCancel];
+}
+
+// ai coding: 让文件移动方法返回成功状态，供快捷键完成后选择相邻项目 2026/09/17: 11:51
+- (BOOL)moveURLs:(NSArray<NSURL *> *)urls toDrawerID:(NSString *)drawerID {
+    NSError *error = nil;
+    if (![_store importURLs:urls drawerID:drawerID error:&error]) {
+        [self showError:error window:_controllers[drawerID].panel];
+        return NO;
+    }
+    [_controllers[drawerID] reloadContent];
+    return YES;
+}
+
+- (void)showAll:(id)sender { for (SDDrawerPanelController *controller in _controllers.allValues) [controller show]; }
+- (void)hideAll:(id)sender { for (SDDrawerPanelController *controller in _controllers.allValues) [controller.panel orderOut:nil]; }
+- (void)quit:(id)sender { [NSApp terminate:nil]; }
+
+- (void)applicationWillTerminate:(NSNotification *)notification {
+    [NSWorkspace.sharedWorkspace.notificationCenter removeObserver:self];
+    // ai coding: 退出时释放 Carbon 全局热键和事件处理器 2026/09/17: 09:44
+    if (_hotKey) UnregisterEventHotKey(_hotKey);
+    if (_hotKeyEventHandler) RemoveEventHandler(_hotKeyEventHandler);
+}
+
+- (void)showError:(NSError *)error window:(NSWindow *)window {
+    if (!error) return;
+    NSAlert *alert = [NSAlert alertWithError:error];
+    if (window) [alert beginSheetModalForWindow:window completionHandler:nil];
+    else [alert runModal];
+}
+@end
+
+// ai coding: 标记应用入口的系统保留参数，保持严格编译零警告 2026/09/16: 20:50
+int main(int argc __unused, const char *argv[] __unused) {
+    @autoreleasepool {
+        NSDictionary<NSString *, NSString *> *environment = NSProcessInfo.processInfo.environment;
+        if ([environment[@"SIDEDRAWER_SELF_TEST"] isEqualToString:@"1"]) {
+            NSError *error = nil;
+            SDDrawerStore *store = [[SDDrawerStore alloc] initWithError:&error];
+            NSString *drawerID = store.drawers.firstObject[@"id"];
+            NSURL *source = [NSURL fileURLWithPath:environment[@"SIDEDRAWER_TEST_SOURCE"]];
+            NSURL *exportDirectory = [NSURL fileURLWithPath:environment[@"SIDEDRAWER_TEST_EXPORT"] isDirectory:YES];
+            BOOL imported = store && [store importURLs:@[source] drawerID:drawerID error:&error];
+            BOOL sourceRemoved = ![NSFileManager.defaultManager fileExistsAtPath:source.path];
+            NSURL *folder = imported ? [store saveDrawerID:drawerID inDirectory:exportDirectory error:&error] : nil;
+            NSURL *exportedFile = [folder URLByAppendingPathComponent:source.lastPathComponent];
+            BOOL exported = folder && [NSFileManager.defaultManager fileExistsAtPath:exportedFile.path];
+            BOOL drawerEmpty = [store itemsForDrawerID:drawerID].count == 0;
+            if (imported && sourceRemoved && exported && drawerEmpty) {
+                fprintf(stdout, "SIDEDRAWER_SELF_TEST_OK\n");
+                return 0;
+            }
+            fprintf(stderr, "SIDEDRAWER_SELF_TEST_FAILED: %s\n", error.localizedDescription.UTF8String ?: "unknown");
+            return 1;
+        }
+        NSApplication *application = NSApplication.sharedApplication;
+        SDAppDelegate *delegate = [[SDAppDelegate alloc] init];
+        application.delegate = delegate;
+        [application run];
+    }
+    return 0;
+}

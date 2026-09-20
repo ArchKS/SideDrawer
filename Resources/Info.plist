@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- ai coding: 更新预览内滚动版本号 2026/09/17: 13:58 -->
+<!-- ai coding: 苹果事件用途说明改为访达与抽屉用词并同步版本说明 2026/09/17: 16:11 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -32,6 +32,6 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSAppleEventsUsageDescription</key>
-    <string>SideDrawer 需要读取 Finder 当前选中的文件或文件夹，以便通过自定义快捷键将其移入收纳箱。</string>
+    <string>SideDrawer 需要读取访达中当前选中的文件或文件夹，以便通过自定义快捷键将其移入抽屉。</string>
 </dict>
 </plist>
