@@ -1,4 +1,4 @@
-// ai coding: 拆分出收纳盒选项按钮与选择面板实现 2026/09/17: 15:34
+// ai coding: 让抽屉选择面板支持多行多列选项与键盘导航 2026/09/20: 09:54
 #import "SDDrawerChoicePanel.h"
 
 @implementation SDDrawerChoiceButton
@@ -50,6 +50,7 @@
 - (BOOL)canBecomeKeyWindow { return YES; }
 - (BOOL)canBecomeMainWindow { return NO; }
 
+// ai coding: 更新网格中的键盘选中状态，所有选项常驻显示无需滚动 2026/09/20: 09:54
 - (void)setSelectedIndex:(NSInteger)selectedIndex {
     if (self.choiceButtons.count == 0) {
         _selectedIndex = NSNotFound;
@@ -59,10 +60,9 @@
     [self.choiceButtons enumerateObjectsUsingBlock:^(SDDrawerChoiceButton *button, NSUInteger index, BOOL *stop __unused) {
         [button setKeyboardSelected:index == (NSUInteger)self->_selectedIndex];
     }];
-    SDDrawerChoiceButton *selectedButton = self.choiceButtons[(NSUInteger)_selectedIndex];
-    [selectedButton scrollRectToVisible:selectedButton.bounds];
 }
 
+// ai coding: 按网格行列处理上下左右键，单列时保持原有上下选择体验 2026/09/20: 09:54
 - (BOOL)handleChoiceShortcut:(NSEvent *)event {
     if (event.type != NSEventTypeKeyDown) return NO;
     NSEventModifierFlags modifiers = event.modifierFlags &
@@ -83,12 +83,24 @@
         return YES;
     }
     if (modifiers != 0) return NO;
+    NSUInteger columnCount = MAX((NSUInteger)1, self.choiceColumnCount);
+    NSInteger currentIndex = _selectedIndex == NSNotFound ? 0 : _selectedIndex;
+    NSInteger targetIndex = currentIndex;
     if (event.keyCode == 126) {
-        self.selectedIndex -= 1;
-        return YES;
+        targetIndex -= (NSInteger)columnCount;
+    } else if (event.keyCode == 125) {
+        targetIndex += (NSInteger)columnCount;
+    } else if (event.keyCode == 123) {
+        if ((NSUInteger)currentIndex % columnCount > 0) targetIndex -= 1;
+    } else if (event.keyCode == 124) {
+        if ((NSUInteger)currentIndex % columnCount + 1 < columnCount) targetIndex += 1;
+    } else {
+        targetIndex = NSNotFound;
     }
-    if (event.keyCode == 125) {
-        self.selectedIndex += 1;
+    if (targetIndex != NSNotFound) {
+        if (targetIndex >= 0 && targetIndex < (NSInteger)self.choiceButtons.count) {
+            self.selectedIndex = targetIndex;
+        }
         return YES;
     }
     if (event.keyCode == 36 || event.keyCode == 76 || [characters isEqualToString:@"\r"]) {

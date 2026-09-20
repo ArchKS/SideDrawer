@@ -756,21 +756,25 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
     });
 }
 
-// ai coding: 将列表项改为左侧纯名称、右侧快捷键提示且不显示图标或数量 2026/09/17: 11:23
+// ai coding: 将快捷键目标面板改为最多六行的自适应多列网格，一次展示全部抽屉 2026/09/20: 09:54
 - (SDDrawerChoicePanel *)drawerChoicePanelForDrawers:(NSArray<NSDictionary *> *)drawers
                                            itemCount:(NSInteger)itemCount {
-    CGFloat panelWidth = 168;
     CGFloat contentInset = 12;
-    CGFloat innerWidth = panelWidth - contentInset * 2;
+    CGFloat columnWidth = 144;
+    CGFloat columnGap = 8;
     CGFloat rowHeight = 40;
     CGFloat rowGap = 6;
-    NSUInteger visibleRows = MIN(drawers.count, (NSUInteger)6);
-    CGFloat visibleListHeight = visibleRows * rowHeight + (visibleRows > 0 ? (visibleRows - 1) * rowGap : 0);
-    CGFloat documentHeight = drawers.count * rowHeight + (drawers.count > 0 ? (drawers.count - 1) * rowGap : 0);
+    NSUInteger maximumRowCount = 6;
+    NSUInteger columnCount = MAX((NSUInteger)1,
+                                 (drawers.count + maximumRowCount - 1) / maximumRowCount);
+    NSUInteger rowCount = drawers.count == 0 ? 0 : (drawers.count + columnCount - 1) / columnCount;
+    CGFloat gridWidth = columnCount * columnWidth + (columnCount - 1) * columnGap;
+    CGFloat gridHeight = rowCount * rowHeight + (rowCount > 0 ? (rowCount - 1) * rowGap : 0);
+    CGFloat panelWidth = gridWidth + contentInset * 2;
     CGFloat cancelHeight = 36;
     CGFloat headerHeight = 146;
     CGFloat listBottom = contentInset + cancelHeight + 10;
-    CGFloat headerBottom = listBottom + visibleListHeight + 14;
+    CGFloat headerBottom = listBottom + gridHeight + 14;
     CGFloat panelHeight = headerBottom + headerHeight + contentInset;
 
     SDDrawerChoicePanel *panel = [[SDDrawerChoicePanel alloc]
@@ -806,7 +810,7 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
 
     // ai coding: 多抽屉选择面板标题与说明统一使用“抽屉”和“访达”  2026/09/17: 16:06
     NSTextField *titleLabel = [NSTextField labelWithString:@"选择抽屉"];
-    titleLabel.frame = NSMakeRect(contentInset, headerBottom + 69, innerWidth, 24);
+    titleLabel.frame = NSMakeRect(contentInset, headerBottom + 69, gridWidth, 24);
     titleLabel.font = [NSFont systemFontOfSize:17 weight:NSFontWeightSemibold];
     titleLabel.textColor = NSColor.labelColor;
     titleLabel.alignment = NSTextAlignmentCenter;
@@ -814,14 +818,15 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
 
     NSTextField *descriptionLabel = [NSTextField wrappingLabelWithString:
         [NSString stringWithFormat:@"点击目标，将访达中选中的 %ld 个项目立即移动过去：", (long)itemCount]];
-    descriptionLabel.frame = NSMakeRect(contentInset, headerBottom + 2, innerWidth, 60);
+    descriptionLabel.frame = NSMakeRect(contentInset, headerBottom + 2, gridWidth, 60);
     descriptionLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightRegular];
     descriptionLabel.textColor = NSColor.secondaryLabelColor;
     descriptionLabel.alignment = NSTextAlignmentCenter;
     descriptionLabel.maximumNumberOfLines = 4;
     [background addSubview:descriptionLabel];
 
-    SDFlippedView *document = [[SDFlippedView alloc] initWithFrame:NSMakeRect(0, 0, innerWidth, MAX(rowHeight, documentHeight))];
+    SDFlippedView *grid = [[SDFlippedView alloc]
+        initWithFrame:NSMakeRect(contentInset, listBottom, gridWidth, MAX(rowHeight, gridHeight))];
     NSMutableArray<NSString *> *drawerIDs = [NSMutableArray arrayWithCapacity:drawers.count];
     NSMutableArray<SDDrawerChoiceButton *> *choiceButtons = [NSMutableArray arrayWithCapacity:drawers.count];
     [drawers enumerateObjectsUsingBlock:^(NSDictionary *drawer, NSUInteger index, BOOL *stop __unused) {
@@ -839,23 +844,20 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
             ? [NSString stringWithFormat:@"⌥%lu 或 ⌘%lu：%@", (unsigned long)index + 1,
                                                         (unsigned long)index + 1, drawerName]
             : drawerName;
-        button.frame = NSMakeRect(0, index * (rowHeight + rowGap), innerWidth, rowHeight);
-        [document addSubview:button];
+        NSUInteger row = index / columnCount;
+        NSUInteger column = index % columnCount;
+        button.frame = NSMakeRect(column * (columnWidth + columnGap),
+                                  row * (rowHeight + rowGap),
+                                  columnWidth,
+                                  rowHeight);
+        [grid addSubview:button];
         [choiceButtons addObject:button];
     }];
     _drawerChoiceIDs = drawerIDs;
-    NSScrollView *scroll = [[NSScrollView alloc]
-        initWithFrame:NSMakeRect(contentInset, listBottom, innerWidth, visibleListHeight)];
-    scroll.drawsBackground = NO;
-    scroll.borderType = NSNoBorder;
-    scroll.hasVerticalScroller = documentHeight > visibleListHeight;
-    scroll.scrollerStyle = NSScrollerStyleOverlay;
-    scroll.autohidesScrollers = YES;
-    scroll.documentView = document;
-    [background addSubview:scroll];
+    [background addSubview:grid];
 
     NSButton *cancelButton = [NSButton buttonWithTitle:@"取消" target:self action:@selector(cancelDrawerChoice:)];
-    cancelButton.frame = NSMakeRect(contentInset, contentInset, innerWidth, cancelHeight);
+    cancelButton.frame = NSMakeRect(contentInset, contentInset, gridWidth, cancelHeight);
     cancelButton.bordered = YES;
     cancelButton.bezelStyle = NSBezelStyleRounded;
     cancelButton.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
@@ -867,6 +869,7 @@ static OSStatus SDGlobalHotKeyHandler(EventHandlerCallRef nextHandler __unused,
         [weakSelf selectDrawerAtIndex:index];
     };
     panel.choiceButtons = choiceButtons;
+    panel.choiceColumnCount = columnCount;
     panel.selectedIndex = 0;
     return panel;
 }

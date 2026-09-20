@@ -1,4 +1,4 @@
-// ai coding: 拆分出收纳盒选择面板与选项按钮接口 2026/09/17: 15:34
+// ai coding: 为抽屉选择面板增加多列网格导航接口 2026/09/20: 09:54
 #import "SDCommon.h"
 
 @interface SDDrawerChoiceButton : NSButton
@@ -12,4 +12,5 @@
 @property(nonatomic, copy) void (^selectionHandler)(NSInteger index);
 @property(nonatomic, copy) NSArray<SDDrawerChoiceButton *> *choiceButtons;
 @property(nonatomic) NSInteger selectedIndex;
+@property(nonatomic) NSUInteger choiceColumnCount;
 @end
